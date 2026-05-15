@@ -1,5 +1,6 @@
 .env
 *.db
+history.json
 data/
 __pycache__/
 *.py[cod]

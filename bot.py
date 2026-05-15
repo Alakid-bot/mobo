@@ -112,21 +112,46 @@ async def summarise_history(history: list[dict]) -> str:
     return result
 
 
+MAX_DISCORD_MSG = 1990  # 2000 limit minus room for the "▌" cursor
+
+
 async def stream_reply(message: discord.Message, messages: list[dict]) -> str:
-    """Stream LLM response, editing the Discord message every ~1 second."""
+    """Stream LLM response, editing the Discord message every ~1 second.
+
+    Splits the response across multiple Discord messages when it exceeds the
+    2000-char per-message limit, preferring to break on newlines.
+    """
     sent = await message.reply("▌")
-    buffer = ""
+    full = ""      # everything generated, returned for DB storage
+    current = ""   # text in the message currently being edited
     last_edit = asyncio.get_event_loop().time()
 
     async for chunk in llm.stream(messages):
-        buffer += chunk
+        full += chunk
+        current += chunk
+
+        while len(current) > MAX_DISCORD_MSG:
+            split_at = current.rfind("\n", 0, MAX_DISCORD_MSG)
+            if split_at <= 0:
+                split_at = MAX_DISCORD_MSG
+            head, current = current[:split_at], current[split_at:].lstrip("\n")
+            await sent.edit(content=head)
+            sent = await message.channel.send("▌")
+            last_edit = asyncio.get_event_loop().time()
+
         now = asyncio.get_event_loop().time()
         if now - last_edit >= 1.0:
-            await sent.edit(content=buffer + "▌")
+            await sent.edit(content=current + "▌")
             last_edit = now
 
-    await sent.edit(content=buffer)
-    return buffer
+    if current:
+        await sent.edit(content=current)
+    elif full:
+        await sent.delete()
+    else:
+        await sent.edit(content="(no response)")
+
+    return full
 
 
 def build_image_content(text: str, attachments: list[discord.Attachment]) -> list | str:
