@@ -44,9 +44,9 @@ logging.getLogger("discord").setLevel(logging.WARNING)
 
 PERSONAS: dict[str, str] = {
     "default":   settings.system_prompt,
-    "concise":   "You are 1812. Be extremely concise. Answer in as few words as possible.",
-    "creative":  "You are 1812, a wildly creative and imaginative assistant. Think outside the box.",
-    "technical": "You are 1812, a precise technical expert. Give detailed, accurate technical answers.",
+    "concise":   settings.system_prompt + " Be extremely concise. One or two sentences max unless the question demands more.",
+    "creative":  settings.system_prompt + " Lean into creative, lateral thinking. Surprising angles welcome.",
+    "technical": settings.system_prompt + " Go deep on technical detail. Show your work. Include code when it helps.",
 }
 
 intents = discord.Intents.default()
