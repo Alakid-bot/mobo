@@ -1,111 +1,260 @@
 #!/usr/bin/env python3
 """
-1812 — Discord chatbot powered by OpenAI
+1812 — Discord chatbot
 """
 
-import os
+import asyncio
+import logging
+import signal
 import json
+import sys
+import time
+from typing import AsyncIterator
+
 import discord
+from discord import app_commands
 from discord.ext import commands
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
-from pathlib import Path
 
-load_dotenv()
+import db
+from config import settings
+from llm import build_backend, LLMBackend
+from rate_limiter import RateLimiter
+from web import run_web_in_background
 
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are 1812, a helpful and friendly Discord chatbot.")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# --- Structured JSON logging ---
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        })
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+log = logging.getLogger("1812")
+
+# Suppress discord.py's own verbose logging
+logging.getLogger("discord").setLevel(logging.WARNING)
+
+# --- Bot setup ---
+
+PERSONAS: dict[str, str] = {
+    "default":   settings.system_prompt,
+    "concise":   "You are 1812. Be extremely concise. Answer in as few words as possible.",
+    "creative":  "You are 1812, a wildly creative and imaginative assistant. Think outside the box.",
+    "technical": "You are 1812, a precise technical expert. Give detailed, accurate technical answers.",
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-HISTORY_FILE = Path("history.json")
-
-
-def load_history() -> dict[int, list[dict]]:
-    if HISTORY_FILE.exists():
-        raw = json.loads(HISTORY_FILE.read_text())
-        return {int(k): v for k, v in raw.items()}
-    return {}
+rate_limiter = RateLimiter(
+    max_requests=settings.rate_limit_requests,
+    window_seconds=settings.rate_limit_window_seconds,
+)
+llm: LLMBackend = build_backend()
 
 
-def save_history(history: dict[int, list[dict]]):
-    HISTORY_FILE.write_text(json.dumps({str(k): v for k, v in history.items()}, indent=2))
+# --- Helpers ---
+
+def system_prompt_for(server_id: int | None) -> str:
+    return PERSONAS.get("default", settings.system_prompt)
 
 
-# Per-channel conversation history (persisted to history.json)
-history: dict[int, list[dict]] = load_history()
+async def resolve_system_prompt(server_id: int | None) -> str:
+    if server_id:
+        custom = await db.get_server_system_prompt(server_id)
+        if custom:
+            return custom
+    return settings.system_prompt
 
+
+async def build_context(channel_id: int, server_id: int | None, user_id: int, new_content: list | str) -> list[dict]:
+    system = await resolve_system_prompt(server_id)
+
+    # Inject per-user memory if available
+    memory = await db.get_user_memory(user_id)
+    if memory:
+        system = f"{system}\n\nWhat you know about this user: {memory}"
+
+    history = await db.get_channel_history(channel_id)
+
+    # Summarise if history is too long
+    if len(history) >= settings.summarise_at:
+        summary = await summarise_history(history)
+        await db.replace_channel_history(channel_id, [
+            {"role": "assistant", "content": f"[Summary of earlier conversation]: {summary}"}
+        ])
+        history = await db.get_channel_history(channel_id)
+
+    # Keep last N messages
+    if len(history) > settings.max_history_messages:
+        history = history[-settings.max_history_messages:]
+
+    messages = [{"role": "system", "content": system}] + history
+    messages.append({"role": "user", "content": new_content})
+    return messages
+
+
+async def summarise_history(history: list[dict]) -> str:
+    summarise_prompt = [
+        {"role": "system", "content": "You are a summariser. Summarise the following conversation concisely in 3-5 sentences."},
+        {"role": "user", "content": "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history)},
+    ]
+    result = ""
+    async for chunk in llm.stream(summarise_prompt):
+        result += chunk
+    return result
+
+
+async def stream_reply(message: discord.Message, messages: list[dict]) -> str:
+    """Stream LLM response, editing the Discord message every ~1 second."""
+    sent = await message.reply("▌")
+    buffer = ""
+    last_edit = asyncio.get_event_loop().time()
+
+    async for chunk in llm.stream(messages):
+        buffer += chunk
+        now = asyncio.get_event_loop().time()
+        if now - last_edit >= 1.0:
+            await sent.edit(content=buffer + "▌")
+            last_edit = now
+
+    await sent.edit(content=buffer)
+    return buffer
+
+
+def build_image_content(text: str, attachments: list[discord.Attachment]) -> list | str:
+    """Build OpenAI vision-compatible content if images are attached."""
+    images = [a for a in attachments if a.content_type and a.content_type.startswith("image/")]
+    if not images:
+        return text
+
+    content: list = [{"type": "text", "text": text}]
+    for img in images:
+        content.append({"type": "image_url", "image_url": {"url": img.url}})
+    return content
+
+
+# --- Events ---
 
 @bot.event
 async def on_ready():
-    print(f"1812 online as {bot.user} (ID: {bot.user.id})")
+    await db.init_db()
+    await bot.tree.sync()
+    run_web_in_background()
+    log.info(f"1812 online as {bot.user} (ID: {bot.user.id})")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    print(f"[MSG] {message.author}: {message.content!r}")
-
     if message.author.bot:
         return
 
-    # Only respond when mentioned (user or role) or in DMs
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
     bot_role_ids = {r.id for r in message.guild.me.roles} if message.guild else set()
     is_role_mentioned = any(r.id in bot_role_ids for r in message.role_mentions)
-    print(f"[MSG] is_dm={is_dm} is_mentioned={is_mentioned} is_role_mentioned={is_role_mentioned}")
 
     if not is_dm and not is_mentioned and not is_role_mentioned:
         await bot.process_commands(message)
         return
 
-    # Strip the mention from the message content
-    content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-    print(f"[MSG] content after strip: {content!r}")
-    if not content:
+    # Rate limit
+    if not rate_limiter.is_allowed(message.author.id):
+        wait = rate_limiter.seconds_until_reset(message.author.id)
+        await message.reply(f"Slow down. Try again in {wait}s.")
+        return
+
+    text = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    if not text and not message.attachments:
         await message.reply("Yeah?")
         return
 
-    channel_id = message.channel.id
-    if channel_id not in history:
-        history[channel_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    content = build_image_content(text or "What's in this image?", message.attachments)
+    server_id = message.guild.id if message.guild else None
 
-    history[channel_id].append({"role": "user", "content": content})
+    try:
+        messages = await build_context(message.channel.id, server_id, message.author.id, content)
+        reply = await stream_reply(message, messages)
 
-    async with message.channel.typing():
-        try:
-            response = await openai.chat.completions.create(
-                model=MODEL,
-                messages=history[channel_id],
-                max_tokens=1024,
-            )
-            reply = response.choices[0].message.content
-            history[channel_id].append({"role": "assistant", "content": reply})
+        await db.add_message(message.channel.id, "user", text or "[image]", message.author.id, str(message.author))
+        await db.add_message(message.channel.id, "assistant", reply)
 
-            # Keep history to last 20 messages to avoid token bloat
-            if len(history[channel_id]) > 21:  # 1 system + 20 messages
-                history[channel_id] = [history[channel_id][0]] + history[channel_id][-20:]
+        log.info({"event": "reply", "channel": message.channel.id, "user": str(message.author)})
+    except Exception as e:
+        log.error({"event": "error", "error": str(e)})
+        await message.reply(f"Something went wrong: {type(e).__name__}")
+        raise
 
-            save_history(history)
-            await message.reply(reply)
-        except Exception as e:
-            await message.reply(f"Something went wrong: {type(e).__name__}")
-            raise
+    await bot.process_commands(message)
 
 
-@bot.command(name="clear")
-async def clear_history(ctx: commands.Context):
-    """Clear conversation history for this channel."""
-    history.pop(ctx.channel.id, None)
-    save_history(history)
-    await ctx.send("Conversation history cleared.")
+# --- Slash Commands ---
+
+@bot.tree.command(name="clear", description="Clear conversation history for this channel.")
+async def slash_clear(interaction: discord.Interaction):
+    await db.clear_channel_history(interaction.channel_id)
+    await interaction.response.send_message("Conversation history cleared.", ephemeral=True)
+    log.info({"event": "clear", "channel": interaction.channel_id, "user": str(interaction.user)})
+
+
+@bot.tree.command(name="persona", description="Switch 1812's persona for this server.")
+@app_commands.describe(name="Persona name: default, concise, creative, technical")
+async def slash_persona(interaction: discord.Interaction, name: str):
+    if name not in PERSONAS:
+        options = ", ".join(PERSONAS.keys())
+        await interaction.response.send_message(f"Unknown persona. Options: {options}", ephemeral=True)
+        return
+
+    if interaction.guild:
+        await db.set_server_system_prompt(interaction.guild.id, interaction.guild.name, PERSONAS[name])
+
+    await interaction.response.send_message(f"Persona set to **{name}**.", ephemeral=True)
+    log.info({"event": "persona", "persona": name, "guild": str(interaction.guild_id)})
+
+
+@bot.tree.command(name="model", description="Switch the LLM model (admin only).")
+@app_commands.describe(model="Model name e.g. gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022")
+@app_commands.default_permissions(administrator=True)
+async def slash_model(interaction: discord.Interaction, model: str):
+    global llm
+    settings.llm_model = model
+    llm = build_backend()
+    await interaction.response.send_message(f"Model switched to **{model}**.", ephemeral=True)
+    log.info({"event": "model_switch", "model": model, "user": str(interaction.user)})
+
+
+@bot.tree.command(name="remember", description="Tell 1812 something to remember about you.")
+@app_commands.describe(text="What should 1812 remember?")
+async def slash_remember(interaction: discord.Interaction, text: str):
+    existing = await db.get_user_memory(interaction.user.id)
+    updated = f"{existing}\n{text}".strip() if existing else text
+    await db.set_user_memory(interaction.user.id, str(interaction.user), updated)
+    await interaction.response.send_message("Got it. I'll remember that.", ephemeral=True)
+
+
+@bot.tree.command(name="forget", description="Clear everything 1812 remembers about you.")
+async def slash_forget(interaction: discord.Interaction):
+    await db.set_user_memory(interaction.user.id, str(interaction.user), "")
+    await interaction.response.send_message("Memory cleared.", ephemeral=True)
+
+
+# --- Graceful shutdown ---
+
+def handle_shutdown(signum, frame):
+    log.info({"event": "shutdown", "signal": signum})
+    asyncio.get_event_loop().stop()
+
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    bot.run(settings.discord_token, log_handler=None)

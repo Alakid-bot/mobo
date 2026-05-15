@@ -14,13 +14,18 @@ pip install -r requirements.txt
 if [ ! -f .env ]; then
     cp .env.example .env
     echo "Created .env from .env.example"
-    echo "IMPORTANT: Edit .env and fill in your DISCORD_TOKEN and OPENAI_API_KEY before running the bot."
+    echo "IMPORTANT: Edit .env and fill in your DISCORD_TOKEN and API key before running."
 else
     echo ".env already exists, skipping."
 fi
 
+mkdir -p data
+
 echo ""
 echo "=== Setup Complete ==="
 echo "Next steps:"
-echo "1. Edit .env with your DISCORD_TOKEN and OPENAI_API_KEY"
+echo "1. Edit .env with your DISCORD_TOKEN and API key"
 echo "2. Run: source .venv/bin/activate && python bot.py"
+echo ""
+echo "Or with Docker:"
+echo "  docker compose up --build"

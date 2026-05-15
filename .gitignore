@@ -1,10 +1,10 @@
 .env
-history.json
+*.db
+data/
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
-.venv/
-venv/
 .venv
+venv/
