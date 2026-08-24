@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}全部配置 · mobo 管理台{% endblock %}
+{% block crumb %}全部配置{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">RUNTIME CONFIGURATION</p><h1>每一个可运行时调整的参数</h1><p>保存后立即写入 SQLite。密钥单独加密，留空不会覆盖已有值。</p></div>
+  <button type="submit" form="settings-form" class="primary-button">保存全部更改</button>
+</section>
+
+<div class="settings-layout">
+  <aside class="section-index" aria-label="配置分组">
+    {% for section, fields in sections %}<a href="#section-{{ loop.index }}"><span>{{ '%02d'|format(loop.index) }}</span>{{ section }}</a>{% endfor %}
+  </aside>
+  <form id="settings-form" class="settings-form">
+    {% for section, fields in sections %}
+    <section class="settings-section panel" id="section-{{ loop.index }}">
+      <div class="section-title"><span>{{ '%02d'|format(loop.index) }}</span><div><h2>{{ section }}</h2><p>{{ fields|length }} 项配置</p></div></div>
+      <div class="field-grid">
+        {% for field in fields %}
+        <label class="config-field {{ 'wide' if field.kind == 'textarea' else '' }} {{ 'toggle-field' if field.kind == 'toggle' else '' }}">
+          <span class="field-title">{{ field.label }}</span>
+          {% if field.kind == 'toggle' %}
+            <span class="switch"><input type="checkbox" data-setting data-key="{{ field.key }}" data-kind="toggle" {{ 'checked' if config[field.key] else '' }}><i></i><b>{{ '已开启' if config[field.key] else '已关闭' }}</b></span>
+          {% elif field.kind == 'textarea' %}
+            <textarea data-setting data-key="{{ field.key }}" data-kind="textarea" rows="8">{{ config[field.key] }}</textarea>
+          {% elif field.kind == 'select' %}
+            <select data-setting data-key="{{ field.key }}" data-kind="select">{% for value, label in field.options %}<option value="{{ value }}" {{ 'selected' if config[field.key] == value else '' }}>{{ label }}</option>{% endfor %}</select>
+          {% elif field.kind == 'secret' %}
+            <div class="secret-input"><input type="password" data-setting data-key="{{ field.key }}" data-kind="secret" autocomplete="new-password" placeholder="{{ '已配置 · 输入新值才会替换' if config[field.key] else '尚未配置' }}"><span>{{ 'SET' if config[field.key] else 'EMPTY' }}</span></div>
+            <span class="clear-secret"><input type="checkbox" data-clear-secret="{{ field.key }}"> 明确清空此密钥</span>
+          {% else %}
+            <input type="{{ 'time' if field.kind == 'time' else 'number' if field.kind == 'number' else 'text' }}" data-setting data-key="{{ field.key }}" data-kind="{{ field.kind }}" value="{{ config[field.key] }}" {% if field.minimum is not none %}min="{{ field.minimum }}"{% endif %} {% if field.maximum is not none %}max="{{ field.maximum }}"{% endif %} {% if field.step is not none %}step="{{ field.step }}"{% endif %}>
+          {% endif %}
+          <small>{{ field.help }}</small>
+        </label>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+    <div class="save-dock"><span data-dirty-state>尚未修改</span><button class="primary-button" type="submit">保存配置</button></div>
+  </form>
+</div>
+{% endblock %}

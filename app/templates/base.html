@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{% block title %}mobo 管理台{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+</head>
+<body data-csrf="{{ csrf_token }}">
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="/" aria-label="回到总览">
+        <span class="brand-mark">mo</span>
+        <span><strong>mobo</strong><small>CONTROL ROOM</small></span>
+      </a>
+      <nav aria-label="主导航">
+        <a href="/" class="nav-item {{ 'active' if page == 'dashboard' else '' }}"><span>总览</span><em>01</em></a>
+        <a href="/settings" class="nav-item {{ 'active' if page == 'settings' else '' }}"><span>全部配置</span><em>02</em></a>
+        <a href="/behavior" class="nav-item {{ 'active' if page == 'behavior' else '' }}"><span>性格与行为</span><em>03</em></a>
+        <a href="/memories" class="nav-item {{ 'active' if page == 'memories' else '' }}"><span>记忆库</span><em>04</em></a>
+        <a href="/audit" class="nav-item {{ 'active' if page == 'audit' else '' }}"><span>审计记录</span><em>05</em></a>
+        <a href="/security" class="nav-item {{ 'active' if page == 'security' else '' }}"><span>安全</span><em>06</em></a>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="connection-card">
+          <span class="pulse {{ 'online' if bot_status.ready else '' }}"></span>
+          <div><strong>{{ 'Discord 已连接' if bot_status.ready else 'Discord 启动中' }}</strong><small>{{ bot_status.user_tag }}</small></div>
+        </div>
+        <form action="/logout" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="text-button" type="submit">退出管理台</button>
+        </form>
+      </div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <button class="menu-button" type="button" data-menu-toggle aria-label="打开导航">菜单</button>
+        <div class="crumb">mobo <span>/</span> {% block crumb %}总览{% endblock %}</div>
+        <div class="topbar-meta"><span>{{ session.username }}</span><span class="secure-dot">加密会话</span></div>
+      </header>
+      <main class="content">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+  <div class="toast" role="status" aria-live="polite" data-toast></div>
+</body>
+</html>

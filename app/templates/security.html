@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}安全 · mobo 管理台{% endblock %}
+{% block crumb %}安全{% endblock %}
+{% block content %}
+<section class="page-heading"><div><p class="eyebrow">SECURITY BOUNDARY</p><h1>启动密钥和管理凭据</h1><p>这里可以更换管理员密码。Discord Token、会话密钥与加密根密钥只从 Zeabur 环境读取，不允许通过网页回显。</p></div></section>
+<div class="two-column align-start">
+  <section class="panel">
+    <div class="panel-head"><div><p class="eyebrow">PASSWORD</p><h2>更换管理员密码</h2></div><span class="status-chip on">Argon2id</span></div>
+    <form id="password-form" class="stack-form">
+      <label>当前密码<input name="current_password" type="password" autocomplete="current-password" required></label>
+      <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="16" required></label>
+      <p class="muted">至少 16 位，并同时包含大写、小写、数字和特殊字符。更换后所有会话都会退出。</p>
+      <button class="primary-button" type="submit">更换密码并退出</button>
+    </form>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><div><p class="eyebrow">BOOTSTRAP</p><h2>只读启动配置</h2></div></div>
+    <dl class="security-list"><div><dt>Discord Token</dt><dd>{{ '已设置' if bootstrap.discord_token else '缺失' }}</dd></div><div><dt>会话密钥</dt><dd>{{ '已设置' if bootstrap.session_secret else '缺失' }}</dd></div><div><dt>配置加密密钥</dt><dd>{{ '已设置' if bootstrap.config_encryption_key else '缺失' }}</dd></div><div><dt>SQLite 路径</dt><dd><code>{{ db_path }}</code></dd></div><div><dt>安全 Cookie</dt><dd>{{ '开启' if bootstrap.cookie_secure else '关闭（仅本地）' }}</dd></div></dl>
+  </section>
+</div>
+<section class="panel">
+  <div class="panel-head"><div><p class="eyebrow">ACTIVE SESSIONS</p><h2>当前管理会话</h2></div><span>{{ sessions|length }} 个</span></div>
+  <div class="data-table session-table"><div class="data-row header"><span>创建时间</span><span>到期时间</span><span>IP</span><span>浏览器</span></div>{% for item in sessions %}<div class="data-row"><time>{{ item.created_at[:19].replace('T', ' ') }}</time><time>{{ item.expires_at[:19].replace('T', ' ') }}</time><span>{{ item.ip_address }}</span><span class="truncate">{{ item.user_agent }}</span></div>{% endfor %}</div>
+</section>
+{% endblock %}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>登录 · mobo 管理台</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <section class="login-story" aria-hidden="true">
+      <div class="story-number">mobo</div>
+      <div class="story-line"></div>
+      <p>一个有记忆、有关系、<br>也知道何时保持安静的 Discord 角色。</p>
+      <small>PRIVATE CONTROL ROOM</small>
+    </section>
+    <section class="login-card">
+      <div class="login-brand"><span class="brand-mark">mo</span><strong>mobo</strong></div>
+      <div>
+        <p class="eyebrow">管理员入口</p>
+        <h1>欢迎回来</h1>
+        <p class="muted">请输入部署时设置的强密码。连续失败会触发临时锁定。</p>
+      </div>
+      {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+      <form action="/login" method="post" class="stack-form">
+        <label>用户名<input name="username" autocomplete="username" value="{{ username }}" required maxlength="64"></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required autofocus maxlength="512"></label>
+        <button class="primary-button full" type="submit">进入控制室</button>
+      </form>
+      <p class="login-note">会话 Cookie 仅供本管理台使用，不会交给 Discord 或模型提供商。</p>
+    </section>
+  </main>
+</body>
+</html>

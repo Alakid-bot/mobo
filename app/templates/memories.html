@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}记忆库 · mobo 管理台{% endblock %}
+{% block crumb %}记忆库{% endblock %}
+{% block content %}
+<section class="page-heading"><div><p class="eyebrow">MEMORY VAULT</p><h1>可见、可追溯、可删除的长期记忆</h1><p>这里不会展示仍在保留期内的完整聊天原文，只管理被提炼为长期记忆的内容。</p></div></section>
+<section class="panel">
+  <form class="filter-bar" method="get">
+    <label>服务器<select name="guild_id"><option value="">全部服务器</option>{% for guild in guilds %}<option value="{{ guild.guild_id }}" {{ 'selected' if filter_guild_id == guild.guild_id else '' }}>{{ guild.name }}</option>{% endfor %}</select></label>
+    <label>用户 ID<input name="user_id" value="{{ filter_user_id }}" inputmode="numeric" placeholder="精确筛选"></label>
+    <button class="small-button" type="submit">应用筛选</button><a href="/memories">清除</a>
+  </form>
+  <div class="data-table memory-table">
+    <div class="data-row header"><span>ID / 类型</span><span>归属</span><span>内容</span><span>置信度</span><span></span></div>
+    {% for item in memories %}
+    <div class="data-row" data-memory-id="{{ item.id }}"><span><strong>#{{ item.id }}</strong><small>{{ item.kind }}</small></span><span><strong>{{ item.guild_id }}</strong><small>用户 {{ item.user_id }}</small></span><span class="memory-content">{{ item.content }}</span><span>{{ '%.0f%%'|format(item.confidence * 100) }}<small>重要度 {{ '%.2f'|format(item.importance) }}</small></span><button class="danger-link" type="button" data-delete-memory>删除</button></div>
+    {% else %}<p class="empty">当前筛选下没有长期记忆。</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

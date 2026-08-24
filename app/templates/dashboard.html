@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}总览 · mobo 管理台{% endblock %}
+{% block crumb %}总览{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">ORCHESTRATION STATUS</p>
+    <h1>{{ config.bot_name }} 正在{{ '聆听' if bot_status.ready else '连接 Discord' }}</h1>
+    <p>这里展示的是角色的状态，不是服务噪音。配置、记忆和行为边界都从同一数据库读取。</p>
+  </div>
+  <div class="hero-status {{ 'ready' if bot_status.ready else '' }}">
+    <span>{{ 'LIVE' if bot_status.ready else 'BOOT' }}</span>
+    <strong>{{ bot_status.latency_ms ~ ' ms' if bot_status.latency_ms is not none else '—' }}</strong>
+    <small>GATEWAY LATENCY</small>
+  </div>
+</section>
+
+<section class="metric-grid">
+  <article class="metric-card accent"><span>服务器</span><strong>{{ stats.guilds }}</strong><small>记忆严格按服务器隔离</small></article>
+  <article class="metric-card"><span>长期记忆</span><strong>{{ stats.memories }}</strong><small>用户可自行查看和删除</small></article>
+  <article class="metric-card"><span>关系档案</span><strong>{{ stats.relationships }}</strong><small>熟悉、信任、温暖、疲劳</small></article>
+  <article class="metric-card"><span>原始消息</span><strong>{{ stats.messages }}</strong><small>{{ config.raw_history_days }} 天自动保留策略</small></article>
+</section>
+
+<div class="two-column">
+  <section class="panel mood-panel">
+    <div class="panel-head"><div><p class="eyebrow">CURRENT MOOD</p><h2>此刻的内部状态</h2></div><a href="/behavior">调整</a></div>
+    <div class="mood-orbit">
+      <div class="mood-core"><strong>{{ mood.label }}</strong><span>会随时间回到基线</span></div>
+      <dl>
+        <div><dt>愉悦度</dt><dd>{{ '%.2f'|format(mood.valence) }}</dd></div>
+        <div><dt>精力</dt><dd>{{ '%.2f'|format(mood.energy) }}</dd></div>
+        <div><dt>社交余量</dt><dd>{{ '%.2f'|format(mood.social_budget) }}</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><div><p class="eyebrow">PREFERENCES</p><h2>正在形成的喜好</h2></div><a href="/behavior#preferences">管理</a></div>
+    <div class="preference-list compact">
+      {% for item in preferences %}
+      <div><span>{{ item.topic }}</span><progress class="weight-track" max="100" value="{{ ((item.weight + 1) / 2 * 100)|round }}">{{ item.weight }}</progress><b>{{ '%+.2f'|format(item.weight) }}</b></div>
+      {% else %}<p class="empty">还没有偏好记录。</p>{% endfor %}
+    </div>
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-head"><div><p class="eyebrow">RECENT AUDIT</p><h2>最近发生了什么</h2></div><a href="/audit">全部记录</a></div>
+  <div class="timeline">
+    {% for row in recent_audit %}
+    <div class="timeline-row"><time>{{ row.created_at[:19].replace('T', ' ') }}</time><strong>{{ row.action }}</strong><span>{{ row.actor }}</span><em>{{ row.target or '—' }}</em></div>
+    {% else %}<p class="empty">还没有审计记录。</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

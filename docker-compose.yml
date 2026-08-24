@@ -1,11 +1,13 @@
 services:
-  1812:
+  bot:
     build: .
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data:/app/data
+      - ./data:/data
     ports:
       - "8080:8080"
     environment:
-      DB_PATH: /app/data/1812.db
+      DB_PATH: /data/mobo.db
+      PORT: 8080
+      COOKIE_SECURE: "false"

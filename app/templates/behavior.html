@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}性格与行为 · mobo 管理台{% endblock %}
+{% block crumb %}性格与行为{% endblock %}
+{% block content %}
+<section class="page-heading"><div><p class="eyebrow">BEHAVIOUR LAB</p><h1>让它形成性格，也保留边界</h1><p>偏好会缓慢变化，情绪会回归基线。主动发言同时受全局开关和频道授权控制。</p></div></section>
+
+<section class="panel" id="channels">
+  <div class="panel-head"><div><p class="eyebrow">CHANNEL POLICY</p><h2>频道授权</h2></div><span class="status-chip {{ 'on' if config.proactive_global_enabled else '' }}">全局主动发言 {{ '开' if config.proactive_global_enabled else '关' }}</span></div>
+  <p class="panel-intro">“监听”允许机器人把该频道纳入主动参与评估；“主动”必须同时打开监听。被提及和回复机器人的正常对话不受此列表限制。</p>
+  <div class="channel-table">
+    <div class="channel-row header"><span>服务器 / 频道</span><span>监听</span><span>主动</span><span>状态</span></div>
+    {% for channel in channels %}
+    <div class="channel-row" data-channel-row data-guild-id="{{ channel.guild_id }}" data-channel-id="{{ channel.channel_id }}" data-channel-name="{{ channel.channel_name }}">
+      <span><strong>{{ channel.guild_name or channel.guild_id }}</strong><small># {{ channel.channel_name or channel.channel_id }}</small></span>
+      <label class="mini-switch"><input type="checkbox" data-channel-listen {{ 'checked' if channel.listen_enabled else '' }}><i></i></label>
+      <label class="mini-switch"><input type="checkbox" data-channel-proactive {{ 'checked' if channel.proactive_enabled else '' }}><i></i></label>
+      <button class="small-button" type="button" data-save-channel>保存</button>
+    </div>
+    {% else %}<p class="empty">Discord 尚未连接，因此还没有可配置的频道。连接后刷新本页。</p>{% endfor %}
+  </div>
+</section>
+
+<div class="two-column align-start">
+  <section class="panel" id="preferences">
+    <div class="panel-head"><div><p class="eyebrow">PREFERENCE MODEL</p><h2>主题喜好</h2></div><span>{{ preferences|length }} 个主题</span></div>
+    <form id="preference-form" class="inline-editor">
+      <label>主题<input name="topic" required maxlength="80" placeholder="例如：独立游戏"></label>
+      <label>关键词<input name="keywords" placeholder="游戏, steam, 剧情"></label>
+      <label>权重<input name="weight" type="number" min="-1" max="1" step="0.05" value="0.5"></label>
+      <label class="check-label"><input name="locked" type="checkbox"> 锁定，不再自动变化</label>
+      <button class="primary-button" type="submit">新增或覆盖</button>
+    </form>
+    <div class="preference-list editable">
+      {% for item in preferences %}
+      <div data-preference-id="{{ item.id }}"><span><strong>{{ item.topic }}</strong><small>{{ item.keywords|join(' · ') or '无关键词' }}</small></span><b>{{ '%+.2f'|format(item.weight) }}</b><em>{{ '锁定' if item.locked else item.evidence_count ~ ' 次证据' }}</em><button type="button" data-delete-preference aria-label="删除 {{ item.topic }}">删除</button></div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><div><p class="eyebrow">MOOD OVERRIDE</p><h2>临时情绪</h2></div><strong>{{ mood.label }}</strong></div>
+    <form id="mood-form" class="range-form">
+      <label><span>愉悦度 <output data-output="valence">{{ '%.2f'|format(mood.valence) }}</output></span><input name="valence" type="range" min="-1" max="1" step="0.05" value="{{ mood.valence }}"></label>
+      <label><span>精力 <output data-output="energy">{{ '%.2f'|format(mood.energy) }}</output></span><input name="energy" type="range" min="0" max="1" step="0.05" value="{{ mood.energy }}"></label>
+      <label><span>社交余量 <output data-output="social_budget">{{ '%.2f'|format(mood.social_budget) }}</output></span><input name="social_budget" type="range" min="0" max="1" step="0.05" value="{{ mood.social_budget }}"></label>
+      <button class="primary-button" type="submit">应用临时状态</button>
+      <p class="muted">状态仍会按照“情绪回归半衰期”慢慢回到配置中的基线。</p>
+    </form>
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-head"><div><p class="eyebrow">SERVER PERSONAS</p><h2>服务器人设覆盖</h2></div><a href="/settings#section-1">编辑全局人设</a></div>
+  <div class="guild-personas">
+    {% for guild in guilds %}
+    <form data-guild-persona data-guild-id="{{ guild.guild_id }}"><div><strong>{{ guild.name }}</strong><small>{{ guild.guild_id }}</small></div><textarea name="system_prompt" rows="3" placeholder="留空则使用全局核心人设">{{ guild.system_prompt or '' }}</textarea><button class="small-button" type="submit">保存</button></form>
+    {% else %}<p class="empty">尚未发现服务器。</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

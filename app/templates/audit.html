@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}审计记录 · mobo 管理台{% endblock %}
+{% block crumb %}审计记录{% endblock %}
+{% block content %}
+<section class="page-heading"><div><p class="eyebrow">AUDIT TRAIL</p><h1>重要操作留下痕迹</h1><p>登录、配置、记忆删除、频道授权和密码变更都会记录。模型回复内容不会写入这里。</p></div></section>
+<section class="panel">
+  <div class="data-table audit-table">
+    <div class="data-row header"><span>时间</span><span>操作者</span><span>动作</span><span>目标 / 来源</span></div>
+    {% for row in audit_rows %}<div class="data-row"><time>{{ row.created_at[:19].replace('T', ' ') }}</time><strong>{{ row.actor }}</strong><span>{{ row.action }}</span><span>{{ row.target or '—' }}<small>{{ row.ip_address or '' }}</small></span></div>{% else %}<p class="empty">还没有记录。</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}
