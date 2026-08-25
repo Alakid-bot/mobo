@@ -78,11 +78,13 @@ class MemoryService:
         )
         if existing:
             if reinforce_expires_at is not None:
-                # 再次印证：延长过期（候选期 → 完整保留期）
+                # 再次印证：延长过期（候选期 → 完整保留期）；只延长不缩短，永不过期保持永不过期
                 await self.database.execute(
                     """UPDATE memories SET confidence = MAX(confidence, ?),
                        importance = MAX(importance, ?), reinforcement_count = reinforcement_count + 1,
-                       last_confirmed_at = ?, updated_at = ?, expires_at = ?
+                       last_confirmed_at = ?, updated_at = ?,
+                       expires_at = CASE WHEN expires_at IS NULL THEN NULL
+                                         ELSE MAX(expires_at, ?) END
                        WHERE id = ?""",
                     (confidence, importance, iso_now(), iso_now(), reinforce_expires_at, existing["id"]),
                 )
