@@ -192,7 +192,7 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
         "记忆",
         "toggle",
         True,
-        "关闭后仍可使用显式长期记忆，但不保存聊天原文。",
+        "关闭后仍会提取结构化记忆，但不保存聊天原文。",
     ),
     SettingField(
         "memory_auto_extract",
@@ -200,7 +200,7 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
         "记忆",
         "toggle",
         True,
-        "只提取较明确的自述；用户仍可查看和删除。",
+        "只提取较明确的自述；用户可通过 /忘记我 全部删除。",
     ),
     SettingField(
         "memory_confidence_threshold",

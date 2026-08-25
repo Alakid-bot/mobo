@@ -189,16 +189,6 @@ class MemoryService:
             (guild_id, user_id, iso_now(), limit),
         )
 
-    async def list_all_for_user(self, user_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return await self.database.fetchall(
-            """SELECT id, guild_id, kind, content, confidence, importance,
-                      created_at, updated_at, expires_at
-               FROM memories WHERE user_id = ? AND status = 'active'
-                 AND (expires_at IS NULL OR expires_at > ?)
-               ORDER BY guild_id, importance DESC, updated_at DESC LIMIT ?""",
-            (user_id, iso_now(), limit),
-        )
-
     async def retrieve(
         self,
         guild_id: str,
@@ -276,32 +266,6 @@ class MemoryService:
                 [(iso_now(), row["id"]) for row in selected],
             )
         return selected
-
-    async def forget(self, guild_id: str, user_id: str, query: str) -> int:
-        query = query.strip()
-        if not query:
-            return 0
-        if query.isdigit():
-            return (
-                await self.database.execute(
-                    """DELETE FROM memories
-                       WHERE id = ? AND guild_id = ? AND user_id = ?""",
-                    (int(query), guild_id, user_id),
-                )
-                and 1
-            )
-        rows = await self.database.fetchall(
-            """SELECT id FROM memories WHERE guild_id = ? AND user_id = ?
-               AND status = 'active' AND lower(content) LIKE lower(?) LIMIT 20""",
-            (guild_id, user_id, f"%{query}%"),
-        )
-        if not rows:
-            return 0
-        await self.database.executemany(
-            "DELETE FROM memories WHERE id = ?",
-            [(row["id"],) for row in rows],
-        )
-        return len(rows)
 
     async def auto_extract(
         self,

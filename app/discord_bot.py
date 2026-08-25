@@ -1292,7 +1292,7 @@ class MoboBot(commands.Bot):
             context = await self.state.context.build(
                 payload.guild_id,
                 payload.context_channel_id,
-                payload.user_id if payload.direct else f"observer:{payload.user_id}",
+                payload.user_id,
                 payload.content,
                 public=message.guild is not None,
                 intent_hint=intent_hint,

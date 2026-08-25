@@ -658,6 +658,44 @@ async def test_debounce_burst_context_does_not_depend_on_raw_history(
 
 
 @pytest.mark.asyncio
+async def test_proactive_reply_injects_same_guild_public_memory(state):
+    """非直接（主动插话）路径同样按真实 user_id 注入本服高置信记忆。"""
+    bot, bot_user, channel = await _ready_bot(state)
+    await state.channels.set(
+        "333333333333333",
+        "444444444444444",
+        "general",
+        listen_enabled=True,
+        proactive_enabled=True,
+    )
+    await state.memories.add(
+        "333333333333333",
+        "111111111111111",
+        "用户明确说过怕辣",
+        kind="fact",
+        confidence=0.9,
+    )
+    state.proactive.decide = AsyncMock(
+        return_value=SimpleNamespace(should_speak=True, reason="测试主动")
+    )
+    captured: list[list[dict[str, object]]] = []
+
+    async def complete(_config, messages, *, role):
+        captured.append(messages)
+        return _model_result("ok")
+
+    state.llm.complete = AsyncMock(side_effect=complete)
+    user = FakeUser(111111111111111)
+    message = FakeMessage(120, user, channel, "今晚吃火锅还是烧烤")
+
+    await bot.on_message(message)
+
+    state.proactive.decide.assert_awaited_once()
+    assert state.llm.complete.await_count == 1
+    assert "怕辣" in str(captured[0])
+
+
+@pytest.mark.asyncio
 async def test_intent_and_social_awareness_switches_control_pipeline(state):
     bot, bot_user, channel = await _ready_bot(state)
     await state.runtime.update(

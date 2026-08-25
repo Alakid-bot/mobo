@@ -16,7 +16,7 @@ async def test_memories_are_isolated_by_guild_and_user(state):
 
 
 @pytest.mark.asyncio
-async def test_auto_memory_is_conservative_and_user_can_forget_by_keyword(state):
+async def test_auto_memory_is_conservative(state):
     config = await state.runtime.all()
     created = await state.memories.auto_extract(
         "guild-a",
@@ -38,8 +38,9 @@ async def test_auto_memory_is_conservative_and_user_can_forget_by_keyword(state)
         )
         == []
     )
-    assert await state.memories.forget("guild-a", "user-1", "古典音乐") == 1
-    assert await state.memories.list_for_user("guild-a", "user-1") == []
+    rows = await state.memories.list_for_user("guild-a", "user-1")
+    assert len(rows) == 1
+    assert "古典音乐" in rows[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -407,7 +408,7 @@ async def test_public_scope_caps_at_three_memories(state):
     )
     assert match is not None
     memory_payload = json.loads(match.group(1))
-    assert len(memory_payload) <= 3
+    assert len(memory_payload) == 3
 
 
 @pytest.mark.asyncio
