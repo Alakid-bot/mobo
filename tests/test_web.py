@@ -48,6 +48,25 @@ async def test_protected_pages_redirect_and_health_is_public(state):
 
 
 @pytest.mark.asyncio
+async def test_static_assets_use_same_origin_paths_behind_https_proxy(state):
+    async with client_for(state) as client:
+        login_page = await client.get("/login")
+        assert 'href="/static/app.css"' in login_page.text
+        assert 'href="http://testserver/static/app.css"' not in login_page.text
+
+        await login(client)
+        dashboard = await client.get("/")
+        assert 'href="/static/app.css"' in dashboard.text
+        assert 'src="/static/app.js"' in dashboard.text
+        assert "http://testserver/static/" not in dashboard.text
+
+        stylesheet = await client.get("/static/app.css")
+        script = await client.get("/static/app.js")
+        assert stylesheet.status_code == 200
+        assert script.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_login_renders_every_console_page_and_no_history_api_is_public(state):
     async with client_for(state) as client:
         await login(client)
