@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -195,6 +195,7 @@ class ProactiveService:
         config: dict[str, Any],
         *,
         now: datetime | None = None,
+        pending_count: int = 0,
     ) -> ProactiveDecision:
         if not config["proactive_global_enabled"]:
             return ProactiveDecision(False, "全局主动发言已关闭")
@@ -239,12 +240,21 @@ class ProactiveService:
         # would make mobo's preferences drift even when it ultimately stays quiet.
         # ── 闸门评分（积分 ≥ 阈值直接触发，否则落回概率路径）─────────
         bot_name = str(config.get("bot_name", "mobo"))
+        # 近 5 分钟频道消息构成（原始消息保存关闭时无数据，惩罚自然为 0）
+        window_start = (now_utc - timedelta(minutes=5)).isoformat()
+        recent = await self.database.fetchone(
+            """SELECT COUNT(*) AS total,
+                      COALESCE(SUM(CASE WHEN role = 'bot' THEN 1 ELSE 0 END), 0) AS self_cnt
+               FROM messages
+               WHERE guild_id = ? AND channel_id = ? AND created_at >= ?""",
+            (guild_id, channel_id, window_start),
+        )
         gate_score, gate_detail = score_gate(
             content,
             bot_name,
-            pending_count=0,
-            recent_self_messages=0,
-            recent_total_messages=0,
+            pending_count=pending_count,
+            recent_self_messages=int(recent["self_cnt"]) if recent else 0,
+            recent_total_messages=int(recent["total"]) if recent else 0,
         )
         gate_threshold = int(config.get("gate_threshold", 80))
 

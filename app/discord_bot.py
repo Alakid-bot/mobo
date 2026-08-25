@@ -520,6 +520,8 @@ class MoboBot(commands.Bot):
         synced = await self.tree.sync()
         self.state.bot_status.commands_synced_at = iso_now()
         log.info("synced %s global Chinese commands", len(synced))
+        # 后台线程预热 jieba/拼音表，避免首次拟人化回复在事件循环上同步构建
+        asyncio.get_running_loop().run_in_executor(None, humanize.prewarm)
         self.maintenance.start()
 
     async def on_ready(self) -> None:
@@ -1183,7 +1185,8 @@ class MoboBot(commands.Bot):
             if not config["social_awareness_enabled"]:
                 return
             decision = await self.state.proactive.decide(
-                guild_id, channel_id, user_id, safety.text, config
+                guild_id, channel_id, user_id, safety.text, config,
+                pending_count=len(self._burst_buffer),
             )
             if not decision.should_speak:
                 # 轻量反应：闸门分数落在 [reaction_min_score, gate_threshold) 区间
@@ -1320,7 +1323,11 @@ class MoboBot(commands.Bot):
                 typo_rate = float(payload.config.get("typo_rate", 0.02))
                 max_frag = int(payload.config.get("max_fragments", 4))
                 typing_speed = float(payload.config.get("typing_speed", 12.0))
-                frags = humanize_fragments(result.text, typo_rate=typo_rate, max_fragments=max_frag)
+                frags = humanize_fragments(
+                    result.text if result.text.strip() else "模型没有返回文字。",
+                    typo_rate=typo_rate,
+                    max_fragments=max_frag,
+                )
                 # 逐碎片安全检查
                 checked_frags: list[str] = []
                 for frag in frags:
@@ -1345,11 +1352,11 @@ class MoboBot(commands.Bot):
                 else:
                     output_frags = [mention_prefix + checked_frags[0]] + checked_frags[1:]
                     save_frags = checked_frags
-                # 计算延迟（总窗口 ≤12s）
+                # 计算延迟（含抖动总窗口 ≤12s）
                 raw_delays = [typing_delay(f, typing_speed=typing_speed) for f in output_frags]
                 total_delay = sum(raw_delays)
-                if total_delay > 12.0 and total_delay > 0:
-                    scale = 12.0 / total_delay
+                if total_delay > 11.7 and total_delay > 0:
+                    scale = 11.7 / total_delay
                     raw_delays = [d * scale for d in raw_delays]
                 jitter = [_random.uniform(0.0, 0.3) for _ in raw_delays]
                 delays = [d + j for d, j in zip(raw_delays, jitter)]
@@ -1938,8 +1945,10 @@ class MoboBot(commands.Bot):
         last = self._reaction_cooldowns.get(channel_key, 0.0)
         if now_mono - last < self._REACTION_COOLDOWN_SECONDS:
             return
-        # 日限
-        today = utcnow().date()
+        # 日限（与主动发言日限同源时区）
+        from app.behavior import ProactiveService
+
+        today = ProactiveService._local_now(config).date()
         if self._reaction_daily_date != today:
             self._reaction_daily_date = today
             self._reaction_daily_count = 0
@@ -1947,8 +1956,6 @@ class MoboBot(commands.Bot):
             return
         # 安静时段（复用主动发言配置）
         try:
-            from app.behavior import ProactiveService
-
             now_local = ProactiveService._local_now(config)
             if ProactiveService._in_quiet_hours(
                 now_local,
@@ -1956,8 +1963,9 @@ class MoboBot(commands.Bot):
                 str(config.get("proactive_quiet_end", "08:00")),
             ):
                 return
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            # 时间配置异常时保守起见不反应
+            return
         # 选取表情
         emoji_raw = str(config.get("reaction_emoji_set", "👍,😂,❤️,🤔"))
         emoji_list = [e.strip() for e in emoji_raw.split(",") if e.strip()]

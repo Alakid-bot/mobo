@@ -701,6 +701,55 @@ async def test_proactive_reply_injects_same_guild_public_memory(state):
 
 
 @pytest.mark.asyncio
+async def test_humanized_reply_sends_fragments_separately(state):
+    """拟人化开启（默认配置）：多句输出拆成多条消息发送（管线级覆盖）。"""
+    bot, bot_user, channel = await _ready_bot(state)
+    await state.runtime.update(
+        {"humanization_enabled": True, "typo_rate": 0.0, "typing_speed": 50.0},
+        actor="test",
+    )
+
+    async def complete(_config, messages, *, role):
+        return _model_result("第一句话讲点事情。第二句话再补充一下。")
+
+    state.llm.complete = AsyncMock(side_effect=complete)
+    user = FakeUser(111111111111111)
+    message = FakeMessage(130, user, channel, f"<@{bot_user.id}> 说两句", mentions=[bot_user])
+    await bot.on_message(message)
+
+    contents = [s.content for s in channel.sent]
+    assert len(contents) >= 2
+
+
+@pytest.mark.asyncio
+async def test_humanized_blocked_fragment_collapses_to_refusal(state):
+    """拟人化开启：任一碎片被输出安全拦截，整条回复收敛为拒答（逐碎片检查）。"""
+    from app.discord_bot import SAFE_REFUSAL
+
+    bot, bot_user, channel = await _ready_bot(state, output_terms="香蕉牛奶")
+    await state.runtime.update(
+        {
+            "humanization_enabled": True,
+            "typo_rate": 0.0,
+            "typing_speed": 50.0,
+            "safety_default_action": "block",
+        },
+        actor="test",
+    )
+
+    async def complete(_config, messages, *, role):
+        return _model_result("今天天气不错。香蕉牛奶很好喝。")
+
+    state.llm.complete = AsyncMock(side_effect=complete)
+    user = FakeUser(111111111111111)
+    message = FakeMessage(131, user, channel, f"<@{bot_user.id}> 随便说", mentions=[bot_user])
+    await bot.on_message(message)
+
+    contents = [s.content for s in channel.sent]
+    assert contents == [SAFE_REFUSAL]
+
+
+@pytest.mark.asyncio
 async def test_intent_and_social_awareness_switches_control_pipeline(state):
     bot, bot_user, channel = await _ready_bot(state)
     await state.runtime.update(

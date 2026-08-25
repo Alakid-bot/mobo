@@ -19,12 +19,13 @@ SCORE_CONTENT_LONG_TEXT = 5
 SCORE_CONTENT_LONGER_TEXT = 10
 SCORE_SHORT_REACTION_PENALTY = -25
 
-PRESSURE_STANDARD_SCORE = 20
-PRESSURE_MAX_SCORE = 40
 PRESSURE_FULL_RATIO = 5.0
+PRESSURE_MAX_SCORE = 40
 
 PRESENCE_FREE_RATIO = 0.25
 PRESENCE_FULL_RATIO = 0.60
+# MaiBot 原值 25；mobo 闸门不含 @提及/DM 分量（由 direct 路径短路），
+# 分值整体分布更低，取 40 补偿以维持同等抑制强度。
 PRESENCE_PENALTY_MAX = 40
 
 SHORT_REACTIONS = {"哈哈", "哈哈哈", "草", "笑死", "好", "嗯", "啊", "哦", "6", "666", "？", "?"}
@@ -87,12 +88,11 @@ def _score_content(texts: Sequence[str]) -> tuple[int, list[str]]:
 
 
 def _score_pressure(pending_count: int) -> int:
-    """积压压力分：对数增长，上限 PRESSURE_MAX_SCORE。"""
+    """积压压力分：对数增长，从 0 升至上限 PRESSURE_MAX_SCORE。"""
     if pending_count <= 0:
         return 0
-    # pending_count / 1 对数增长
-    factor = min(1.0, log1p(pending_count) / log1p(PRESSURE_FULL_RATIO * 1))
-    return min(PRESSURE_MAX_SCORE, int(round(PRESSURE_STANDARD_SCORE + (PRESSURE_MAX_SCORE - PRESSURE_STANDARD_SCORE) * factor)))
+    factor = min(1.0, log1p(pending_count) / log1p(PRESSURE_FULL_RATIO))
+    return int(round(PRESSURE_MAX_SCORE * factor))
 
 
 def _score_presence_penalty(recent_self_messages: int, recent_total_messages: int) -> int:

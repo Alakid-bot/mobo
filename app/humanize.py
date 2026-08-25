@@ -13,7 +13,7 @@ from collections import defaultdict
 from math import exp
 from typing import Sequence
 
-# ── jieba + pypinyin 在模块级加载一次 ────────────────────────────────
+# ── jieba + pypinyin：首次使用时惰性构建，prewarm() 可在启动时预热 ──
 import jieba  # type: ignore[import-untyped]
 from pypinyin import Style, pinyin  # type: ignore[import-untyped]
 
@@ -23,7 +23,7 @@ _MAX_DISCORD_MESSAGE = 1980
 _IMMUNITY_RE = re.compile(
     r"```[\s\S]*?```"                       # fenced code block
     r"|`[^`\n]+`"                            # inline code
-    r"|https?://\S+"                         # URL
+    r"|https?://[^\s\u4e00-\u9fff，。；！？、）】》：""''…]+"  # URL（不吞后续中文）
     r"|<@!?\d{15,22}>"                       # user mention
     r"|<@&\d{15,22}>"                        # role mention
     r"|<#\d{15,22}>"                         # channel mention
@@ -82,6 +82,11 @@ def _ensure_loaded() -> None:
         _PINYIN_DICT = _build_pinyin_dict()
     if not _CHAR_FREQUENCY:
         _CHAR_FREQUENCY = _build_char_frequency()
+
+
+def prewarm() -> None:
+    """启动时在工作线程调用：提前构建拼音/字频表，避免首次回复卡顿。"""
+    _ensure_loaded()
 
 
 def _is_chinese(char: str) -> bool:
@@ -448,7 +453,10 @@ def fragments(
     """拆分 → 合并 → 注入错别字 → 硬拆兜底 → 截断到 max_fragments。
 
     免疫区域（代码块、URL、@提及、自定义 emoji）内的文本不做拆分或错别字替换。
+    空白输入返回 []（由调用方兜底）；任何返回片段都不超过 limit。
     """
+    if not text or not text.strip():
+        return []
     sentences = _split_sentences(text)
     sentences = _merge_to_max(sentences, max_fragments)
 
@@ -461,12 +469,12 @@ def fragments(
         for chunk in _hard_split(sentence, limit):
             result.append(chunk)
 
-    # 截断到 max_fragments（多余合并到最后一个）
+    # 截断到 max_fragments（多余合并到最后一个；合并若超限则再硬拆，保证单条 ≤ limit）
     if len(result) > max_fragments and max_fragments > 0:
         merged_tail = "".join(result[max_fragments - 1:])
-        result = result[: max_fragments - 1] + [merged_tail]
+        result = result[: max_fragments - 1] + _hard_split(merged_tail, limit)
 
-    return result if result else [text]
+    return result
 
 
 def _inject_typo_safe(text: str, typo_rate: float) -> str:

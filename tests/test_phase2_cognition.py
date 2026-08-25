@@ -58,11 +58,9 @@ class TestGateNameMention:
 
 class TestGateContent:
     def test_question_marks_score(self):
-        score, detail = score_gate("你好吗？", "bot")
-        # "你好吗？" has "？" but no QUESTION_TERMS, so no question score
-        # But let's use a better example
         score, detail = score_gate("你是怎么做到的？", "bot")
         assert score > 0
+        assert "问题" in detail
 
     def test_request_terms_score(self):
         score, detail = score_gate("帮我看看这个", "bot")
@@ -284,7 +282,16 @@ class TestFragmentsAPI:
 
     def test_empty_text(self):
         frags = fragments("", typo_rate=0.0, max_fragments=4)
-        assert frags == [""]
+        assert frags == []
+
+    def test_tail_merge_never_exceeds_limit(self):
+        """max_fragments 合并尾部后，任何片段仍不超过 1980。"""
+        text = "。" * 50 + "很长的内容" * 800  # 超过 2×1980 字符
+        random.seed(42)
+        frags = fragments(text, typo_rate=0.0, max_fragments=2)
+        assert len(frags) >= 2
+        for f in frags:
+            assert len(f) <= 1980
 
 
 class TestTypingDelay:
@@ -318,34 +325,23 @@ class TestHumanizationGolden:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Task 2 — ordering regression：typo 注入后的敏感词仍被 check_output 捕获
+#  Task 2 — 错别字注入真实生效（管线级"安全检查在拟人化之后"见 pipeline 测试）
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestSafetyAfterTypo:
-    @pytest.mark.asyncio
-    async def test_typo_cannot_bypass_output_safety(self, state):
-        """构造一个场景：typo 注入后恰好变成输出违禁词。"""
-        await state.runtime.update(
-            {"safety_output_terms": "敏感词测试", "safety_default_action": "block"},
-            actor="test",
-        )
-        # "敏感词测试" 作为输出违禁词
-        checked = await state.safety.check_output("这里包含敏感词测试内容")
-        assert not checked.allowed
+class TestTypoMutation:
+    def test_seeded_typo_actually_mutates_text(self):
+        """typo_rate=1.0 + 固定种子：输出必须与输入不同（注入真实发生）。"""
+        text = "今天天气真不错我们一起去公园散步吧"
+        random.seed(7)
+        out = fragments(text, typo_rate=1.0, max_fragments=4)
+        assert "".join(out) != text
 
-    @pytest.mark.asyncio
-    async def test_per_fragment_safety_check(self, state):
-        """每个碎片独立接受安全检查。"""
-        await state.runtime.update(
-            {"safety_output_terms": "secret", "safety_default_action": "block"},
-            actor="test",
-        )
-        # 第一个碎片安全，第二个碎片违规
-        frag1_checked = await state.safety.check_output("安全的内容")
-        assert frag1_checked.allowed
-        frag2_checked = await state.safety.check_output("这里包含 secret")
-        assert not frag2_checked.allowed
+    def test_zero_typo_rate_preserves_text(self):
+        text = "今天天气真不错我们一起去公园散步吧"
+        random.seed(7)
+        out = fragments(text, typo_rate=0.0, max_fragments=4)
+        assert "".join(out) == text
 
 
 # ═══════════════════════════════════════════════════════════════════════
