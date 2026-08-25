@@ -45,6 +45,8 @@ _BUSY_NOTICE_LIMIT = 4096
 _BUSY_NOTICE_COOLDOWN = 5.0
 _SUMMARY_COOLDOWN_LIMIT = 4096
 _SUMMARY_COOLDOWN_TTL = 86_400.0
+_RELAY_USER_MENTION = re.compile(r"@!?(\d{15,22})(?!\d)")
+_RELAY_USER_MENTION_LIMIT = 3
 _MANUAL_SEPARATOR = re.compile(r"[,，、;；\n]+")
 _PRIVATE_MEMORY_REQUESTS = (
     re.compile(
@@ -288,35 +290,18 @@ class PublicCommands(commands.Cog):
 
     @app_commands.command(name="帮助", description="查看你可以使用的中文命令")
     async def help(self, interaction: discord.Interaction) -> None:
-        public = "`/状态` `/记住` `/我的记忆` `/忘记我` `/隐私` `/关系` `/喜好`"
+        public = "`/记住` `/我的记忆` `/忘记我` `/隐私` `/关系` `/喜好`"
         try:
             is_admin = await self.state.discord_admins.is_admin(interaction.user.id)
         except ValueError:
             is_admin = False
         admin = (
-            "\n\n管理员命令\n`/管理台` `/清空频道` `/人设` `/频道设置` `/主动发言` `/重载配置`"
+            "\n\n管理员命令\n`/状态` `/管理台` `/清空频道` `/人设` `/频道设置` `/主动发言` `/重载配置`"
             if is_admin
             else ""
         )
         await interaction.response.send_message(
-            "可用命令\n" + public + admin + "\n\n也可以提及我或回复我的消息来聊天。",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="状态", description="查看机器人当前状态和隐私摘要")
-    @app_commands.guild_only()
-    async def status(self, interaction: discord.Interaction) -> None:
-        config = await self.state.runtime.all()
-        mood = await self.state.mood.current(config)
-        status = self.state.bot_status
-        latency = f"{round(self.bot.latency * 1000)} ms" if self.bot.is_ready() else "未连接"
-        await interaction.response.send_message(
-            f"**{config['bot_name']}** · {'在线' if status.ready else '启动中'}\n"
-            f"模型：`{config['llm_model'] or '未配置'}`（OpenAI 兼容接口）\n"
-            f"延迟：{latency}\n"
-            f"心情：{mood['label']}\n"
-            f"主动发言：{'全局允许（仍需频道开启）' if config['proactive_global_enabled'] else '关闭'}\n"
-            f"原始消息保留：{'不保存' if not config['save_raw_messages'] else str(config['raw_history_days']) + ' 天'}",
+            "可用命令\n" + public + admin,
             ephemeral=True,
         )
 
@@ -473,6 +458,27 @@ class AdminCommands(commands.Cog):
 
     async def _allowed(self, interaction: discord.Interaction) -> bool:
         return await _ensure_allowlist_admin(interaction, self.state)
+
+    @app_commands.command(name="状态", description="查看机器人当前状态和隐私摘要")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.check(_allowlist_admin_check)
+    @app_commands.guild_only()
+    async def status(self, interaction: discord.Interaction) -> None:
+        if not await self._allowed(interaction):
+            return
+        config = await self.state.runtime.all()
+        mood = await self.state.mood.current(config)
+        status = self.state.bot_status
+        latency = f"{round(self.bot.latency * 1000)} ms" if self.bot.is_ready() else "未连接"
+        await interaction.response.send_message(
+            f"**{config['bot_name']}** · {'在线' if status.ready else '启动中'}\n"
+            f"模型：`{config['llm_model'] or '未配置'}`（OpenAI 兼容接口）\n"
+            f"延迟：{latency}\n"
+            f"心情：{mood['label']}\n"
+            f"主动发言：{'全局允许（仍需频道开启）' if config['proactive_global_enabled'] else '关闭'}\n"
+            f"原始消息保留：{'不保存' if not config['save_raw_messages'] else str(config['raw_history_days']) + ' 天'}",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="管理台", description="获取私密管理控制台地址")
     @app_commands.default_permissions(administrator=True)
@@ -643,6 +649,7 @@ class GenerationPayload:
     source_message_db_id: int | None
     generation_version: int
     burst_context: tuple[str | list[dict[str, Any]], ...] = ()
+    mention_user_ids: tuple[int, ...] = ()
 
 
 class MoboBot(commands.Bot):
@@ -1121,6 +1128,43 @@ class MoboBot(commands.Bot):
             return False
         return fetched.author.id == bot_user_id
 
+    async def _relay_member_mentions(
+        self, message: discord.Message, *, replied_to_bot: bool
+    ) -> tuple[int, ...]:
+        """Resolve explicit @user-id tokens without opening general mention permissions."""
+
+        if not replied_to_bot or message.guild is None or self.user is None:
+            return ()
+        candidates: list[int] = []
+        for match in _RELAY_USER_MENTION.finditer(message.content):
+            target_id = int(match.group(1))
+            if target_id in {message.author.id, self.user.id} or target_id in candidates:
+                continue
+            candidates.append(target_id)
+            if len(candidates) >= _RELAY_USER_MENTION_LIMIT:
+                break
+
+        resolved: list[int] = []
+        get_member = getattr(message.guild, "get_member", None)
+        fetch_member = getattr(message.guild, "fetch_member", None)
+        mentioned_members = {
+            member.id: member
+            for member in message.mentions
+            if getattr(member, "id", None) is not None
+        }
+        for target_id in candidates:
+            member = get_member(target_id) if callable(get_member) else None
+            member = member or mentioned_members.get(target_id)
+            if member is None and callable(fetch_member):
+                try:
+                    member = await fetch_member(target_id)
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    continue
+            if member is None or getattr(member, "bot", False):
+                continue
+            resolved.append(target_id)
+        return tuple(resolved)
+
     def _seen(self, message_id: str) -> bool:
         if message_id in self._seen_message_ids:
             return True
@@ -1346,6 +1390,11 @@ class MoboBot(commands.Bot):
             if self._message_allowed(user_id):
                 await message.reply("我在。你想聊什么？", mention_author=False)
             return
+        mention_user_ids = await self._relay_member_mentions(
+            message, replied_to_bot=replied and direct
+        )
+        if not self._message_allowed(user_id):
+            return
         generation_version = self._reserve_generation(key)
         if generation_version is None:
             await self._reply_busy_if_direct(message, direct=direct)
@@ -1378,6 +1427,7 @@ class MoboBot(commands.Bot):
                 source_message_db_id=source_message_db_id,
                 generation_version=generation_version,
                 burst_context=burst_context,
+                mention_user_ids=mention_user_ids,
             )
             assert self.coordinator is not None
             if not self._is_current_generation(key, payload):
@@ -1454,13 +1504,19 @@ class MoboBot(commands.Bot):
             output = checked.text if checked.allowed else SAFE_REFUSAL
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
-            sent = await self._send_public_reply(message, output)
+            public_output = output
+            if payload.mention_user_ids:
+                mention_prefix = " ".join(f"<@{user_id}>" for user_id in payload.mention_user_ids)
+                public_output = f"{mention_prefix} {output}"
+            sent = await self._send_public_reply(
+                message, public_output, mention_user_ids=payload.mention_user_ids
+            )
             for sent_message in sent:
                 self._remember_bot_message(str(sent_message.id), payload.user_id, payload.guild_id)
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
             if payload.listened and payload.config["save_raw_messages"]:
-                for sent_message, chunk in zip(sent, _chunks(output), strict=False):
+                for sent_message, chunk in zip(sent, _chunks(public_output), strict=False):
                     await self._save_message_idempotent(
                         payload.guild_id,
                         payload.channel_id,
@@ -1571,13 +1627,33 @@ class MoboBot(commands.Bot):
             context.insert(insert_at, {"role": "user", "content": content})
             insert_at += 1
 
-    async def _send_public_reply(self, source: discord.Message, text: str) -> list[discord.Message]:
+    async def _send_public_reply(
+        self,
+        source: discord.Message,
+        text: str,
+        *,
+        mention_user_ids: tuple[int, ...] = (),
+    ) -> list[discord.Message]:
         sent: list[discord.Message] = []
+        first_mentions = discord.AllowedMentions(
+            everyone=False,
+            users=[discord.Object(id=user_id) for user_id in mention_user_ids],
+            roles=False,
+            replied_user=False,
+        )
         for index, chunk in enumerate(_chunks(text)):
             if index == 0:
-                sent.append(await source.reply(chunk, mention_author=False))
+                sent.append(
+                    await source.reply(
+                        chunk,
+                        mention_author=False,
+                        allowed_mentions=first_mentions,
+                    )
+                )
             else:
-                sent.append(await source.channel.send(chunk))
+                sent.append(
+                    await source.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+                )
         return sent
 
     async def _learn_after_success(self, payload: GenerationPayload) -> None:

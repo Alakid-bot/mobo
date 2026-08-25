@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from app.discord_bot import AdminCommands, MoboBot, PublicCommands, image_content
 
-PUBLIC_NAMES = {"帮助", "状态", "记住", "我的记忆", "忘记我", "隐私", "关系", "喜好"}
-ADMIN_NAMES = {"管理台", "清空频道", "人设", "频道设置", "主动发言", "重载配置"}
+PUBLIC_NAMES = {"帮助", "记住", "我的记忆", "忘记我", "隐私", "关系", "喜好"}
+ADMIN_NAMES = {"状态", "管理台", "清空频道", "人设", "频道设置", "主动发言", "重载配置"}
 
 
 def test_chinese_command_names_and_admin_visibility_contract(state):

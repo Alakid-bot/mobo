@@ -35,9 +35,10 @@ class FakeTyping:
 
 
 class FakeSent:
-    def __init__(self, message_id: int, content: str) -> None:
+    def __init__(self, message_id: int, content: str, **kwargs: object) -> None:
         self.id = message_id
         self.content = content
+        self.kwargs = kwargs
 
 
 class FakeChannel:
@@ -51,8 +52,8 @@ class FakeChannel:
     def typing(self) -> FakeTyping:
         return FakeTyping(self)
 
-    async def send(self, content: str) -> FakeSent:
-        sent = FakeSent(9000 + len(self.sent), content)
+    async def send(self, content: str, **kwargs: object) -> FakeSent:
+        sent = FakeSent(9000 + len(self.sent), content, **kwargs)
         self.sent.append(sent)
         return sent
 
@@ -68,6 +69,18 @@ class FakeChannel:
                 yield item
 
         return iterator()
+
+
+class FakeGuild:
+    def __init__(self, guild_id: int, members: list[FakeUser] | None = None) -> None:
+        self.id = guild_id
+        self._members = {member.id: member for member in members or []}
+
+    def get_member(self, user_id: int) -> FakeUser | None:
+        return self._members.get(user_id)
+
+    async def fetch_member(self, user_id: int) -> FakeUser | None:
+        return self.get_member(user_id)
 
 
 class FakeMessage:
@@ -87,14 +100,14 @@ class FakeMessage:
         self.author = author
         self.channel = channel
         self.content = content
-        self.guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
+        self.guild = FakeGuild(guild_id) if guild_id is not None else None
         self.mentions = mentions or []
         self.webhook_id = webhook_id
         self.reference = reference
         self.attachments: list[object] = []
 
-    async def reply(self, content: str, **_: object) -> FakeSent:
-        return await self.channel.send(content)
+    async def reply(self, content: str, **kwargs: object) -> FakeSent:
+        return await self.channel.send(content, **kwargs)
 
 
 class FakeResponse:
@@ -133,6 +146,26 @@ async def test_allowlist_is_actual_runtime_authority(state):
 
     assert "白名单" in interaction.response.messages[0][0]
     assert interaction.response.messages[0][1]["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_help_hides_status_from_members_and_has_no_chat_tail(state):
+    bot = MoboBot(state)
+    cog = PublicCommands(bot)
+    member = FakeInteraction(111111111111111)
+    state.discord_admins.is_admin = AsyncMock(return_value=False)
+
+    await cog.help.callback(cog, member)
+
+    member_text = member.response.messages[0][0]
+    assert "`/状态`" not in member_text
+    assert "也可以提及我或回复我的消息来聊天" not in member_text
+
+    admin = FakeInteraction(222222222222222)
+    state.discord_admins.is_admin = AsyncMock(return_value=True)
+    await cog.help.callback(cog, admin)
+    assert "管理员命令" in admin.response.messages[0][0]
+    assert "`/状态`" in admin.response.messages[0][0]
 
 
 @pytest.mark.asyncio
@@ -208,6 +241,60 @@ async def test_output_is_filtered_before_one_shot_send_and_typing_is_used(state)
     assert len(channel.sent) == 1
     assert "secret" not in channel.sent[0].content
     assert "[已隐藏]" in channel.sent[0].content
+
+
+@pytest.mark.asyncio
+async def test_reply_to_bot_can_relay_only_resolved_guild_member_mentions(state):
+    bot, bot_user, channel = await _ready_bot(state)
+    target = FakeUser(222222222222222, name="被邀请者")
+    outsider_id = 333333333333334
+    state.llm.complete = AsyncMock(
+        return_value=_model_result(f"一起来聊聊吧，模型文字里的 <@{outsider_id}> 不应获准提醒。")
+    )
+    reference = SimpleNamespace(
+        message_id=700,
+        resolved=SimpleNamespace(author=bot_user),
+    )
+    message = FakeMessage(
+        201,
+        FakeUser(111111111111111),
+        channel,
+        f"请邀请 @{target.id} 和 @{outsider_id}",
+        reference=reference,
+    )
+    assert message.guild is not None
+    message.guild._members[target.id] = target
+
+    await bot.on_message(message)
+
+    assert len(channel.sent) == 1
+    assert channel.sent[0].content.startswith(f"<@{target.id}> 一起来聊聊吧")
+    allowed = channel.sent[0].kwargs["allowed_mentions"]
+    assert [item.id for item in allowed.users] == [target.id]
+    assert allowed.everyone is False
+    assert allowed.roles is False
+    assert allowed.replied_user is False
+
+
+@pytest.mark.asyncio
+async def test_member_mention_relay_requires_reply_to_bot(state):
+    bot, bot_user, channel = await _ready_bot(state)
+    target = FakeUser(222222222222222, name="被邀请者")
+    state.llm.complete = AsyncMock(return_value=_model_result("普通回复"))
+    message = FakeMessage(
+        202,
+        FakeUser(111111111111111),
+        channel,
+        f"<@{bot_user.id}> 请邀请 @{target.id}",
+        mentions=[bot_user],
+    )
+    assert message.guild is not None
+    message.guild._members[target.id] = target
+
+    await bot.on_message(message)
+
+    assert [item.content for item in channel.sent] == ["普通回复"]
+    assert channel.sent[0].kwargs["allowed_mentions"].users == []
 
 
 @pytest.mark.asyncio
