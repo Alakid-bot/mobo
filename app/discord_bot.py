@@ -524,13 +524,20 @@ class AdminCommands(commands.Cog):
         if interaction.guild is None:
             raise app_commands.NoPrivateMessage()
         value = None if prompt.strip() in {"", "默认"} else prompt.strip()[:4000]
-        await self.state.database.execute(
-            """INSERT INTO guilds(guild_id, name, system_prompt, first_seen_at, updated_at)
-               VALUES(?, ?, ?, ?, ?)
-               ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name,
-                 system_prompt = excluded.system_prompt, updated_at = excluded.updated_at""",
-            (guild_id, interaction.guild.name, value, iso_now(), iso_now()),
-        )
+        await self.bot._upsert_guild(interaction.guild)
+        if value is None:
+            await self.state.database.execute(
+                "DELETE FROM guild_personas WHERE guild_id = ?", (guild_id,)
+            )
+        else:
+            now = iso_now()
+            await self.state.database.execute(
+                """INSERT INTO guild_personas(guild_id, system_prompt, created_at, updated_at)
+                   VALUES(?, ?, ?, ?)
+                   ON CONFLICT(guild_id) DO UPDATE SET
+                     system_prompt = excluded.system_prompt, updated_at = excluded.updated_at""",
+                (guild_id, value, now, now),
+            )
         await interaction.response.send_message(
             "已恢复使用全局人设。" if value is None else "已更新本服务器的人设覆盖。",
             ephemeral=True,
@@ -681,6 +688,7 @@ class MoboBot(commands.Bot):
         self._user_event_condition = asyncio.Condition()
         self._purging_users: set[str] = set()
         self._purge_lock = asyncio.Lock()
+        self._identity_sync_lock = asyncio.Lock()
         self._closing = False
 
     async def setup_hook(self) -> None:
@@ -695,10 +703,11 @@ class MoboBot(commands.Bot):
     async def on_ready(self) -> None:
         self.state.bot_status.connected = True
         self.state.bot_status.ready = True
-        self.state.bot_status.user_tag = str(self.user)
         self.state.bot_status.guild_count = len(self.guilds)
         self.state.bot_status.latency_ms = round(self.latency * 1000)
         self.state.bot_status.last_error = None
+        if self.user is not None:
+            await self._store_identity(self.user)
         await self.refresh_presence()
         for guild in self.guilds:
             await self._upsert_guild(guild)
@@ -714,6 +723,88 @@ class MoboBot(commands.Bot):
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         self.state.bot_status.guild_count = len(self.guilds)
+
+    async def on_user_update(self, before: discord.User, after: discord.User) -> None:
+        if self.user is not None and after.id == self.user.id:
+            await self._store_identity(after)
+
+    async def _store_identity(self, user: discord.abc.User) -> None:
+        status = self.state.bot_status
+        status.user_id = str(user.id)
+        status.user_tag = str(user)
+        status.display_name = user.display_name
+        status.identity_synced_at = iso_now()
+        try:
+            status.avatar_bytes = await user.display_avatar.replace(size=128, format="png").read()
+            status.avatar_version += 1
+        except Exception:
+            log.warning("could not refresh Discord bot avatar", exc_info=True)
+        current_name = str(await self.state.runtime.get("bot_name"))
+        if current_name != user.display_name:
+            await self.state.runtime.update(
+                {"bot_name": user.display_name}, actor="discord:identity_sync"
+            )
+
+    async def refresh_identity(self, *, sync_guilds: bool = True) -> dict[str, Any]:
+        """Refresh the global bot user and clear guild-specific appearance overrides."""
+        async with self._identity_sync_lock:
+            if self.user is None:
+                raise RuntimeError("Discord 尚未连接")
+            user = await self.fetch_user(self.user.id)
+            await self._store_identity(user)
+            result: dict[str, Any] = {
+                "total": len(self.guilds),
+                "synced": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "failures": [],
+            }
+            if not sync_guilds:
+                return result
+            for guild in self.guilds:
+                errors: list[str] = []
+                changed = False
+                member = getattr(guild, "me", None)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user.id)
+                    except Exception as exc:
+                        result["failed"] += 1
+                        result["failures"].append(
+                            {
+                                "guild_id": str(guild.id),
+                                "guild_name": guild.name,
+                                "error": type(exc).__name__,
+                            }
+                        )
+                        continue
+                if member.avatar is not None:
+                    try:
+                        updated = await member.edit(avatar=None, reason="同步 mobo 的全局 Bot 头像")
+                        member = updated or member
+                        changed = True
+                    except Exception as exc:
+                        errors.append(f"头像：{type(exc).__name__}")
+                if member.nick is not None:
+                    try:
+                        await member.edit(nick=None, reason="同步 mobo 的全局 Bot 名称")
+                        changed = True
+                    except Exception as exc:
+                        errors.append(f"昵称：{type(exc).__name__}")
+                if errors:
+                    result["failed"] += 1
+                    result["failures"].append(
+                        {
+                            "guild_id": str(guild.id),
+                            "guild_name": guild.name,
+                            "error": "；".join(errors),
+                        }
+                    )
+                elif changed:
+                    result["synced"] += 1
+                else:
+                    result["unchanged"] += 1
+            return result
 
     async def _upsert_guild(self, guild: discord.Guild) -> None:
         await self.state.database.execute(

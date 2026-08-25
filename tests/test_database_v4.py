@@ -41,13 +41,33 @@ async def test_v1_database_is_backed_up_and_migrated_once(tmp_path):
                       'active', ?, ?)""",
             (iso_now(), iso_now()),
         )
+        connection.execute(
+            """INSERT INTO guilds
+               (guild_id, name, system_prompt, first_seen_at, updated_at)
+               VALUES('guild', '旧服务器', '旧版服务器人设', ?, ?)""",
+            (iso_now(), iso_now()),
+        )
+        connection.execute(
+            """INSERT INTO channel_settings
+               (guild_id, channel_id, channel_name, listen_enabled, proactive_enabled, updated_at)
+               VALUES('guild', 'default-channel', '旧默认记录', 0, 0, ?)""",
+            (iso_now(),),
+        )
         connection.commit()
 
     database = Database(path)
     await database.initialize()
     columns = {row["name"] for row in await database.fetchall("PRAGMA table_info(messages)")}
     assert {"discord_message_id", "reply_to_message_id"} <= columns
-    assert await database.scalar("SELECT MAX(version) AS version FROM schema_migrations") == 2
+    assert await database.scalar("SELECT MAX(version) AS version FROM schema_migrations") == 3
+    assert (
+        await database.scalar("SELECT system_prompt FROM guild_personas WHERE guild_id = 'guild'")
+        == "旧版服务器人设"
+    )
+    assert (
+        await database.scalar("SELECT system_prompt FROM guilds WHERE guild_id = 'guild'") is None
+    )
+    assert await database.scalar("SELECT COUNT(*) AS n FROM channel_settings") == 0
     assert await database.scalar("SELECT COUNT(*) AS n FROM safety_rules") == 0
     memories = MemoryService(database)
     assert await memories.rebuild_legacy_index() == 2
@@ -65,7 +85,7 @@ async def test_v1_database_is_backed_up_and_migrated_once(tmp_path):
     assert await memories.rebuild_legacy_index() == 0
     await database.close()
 
-    backups = list(tmp_path.glob("mobo.db.pre-v2-*.bak"))
+    backups = list(tmp_path.glob("mobo.db.pre-v3-*.bak"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as backup:
         assert backup.execute("SELECT content FROM messages").fetchone()[0] == "legacy"
@@ -74,7 +94,7 @@ async def test_v1_database_is_backed_up_and_migrated_once(tmp_path):
     database = Database(path)
     await database.initialize()
     await database.close()
-    assert list(tmp_path.glob("mobo.db.pre-v2-*.bak")) == backups
+    assert list(tmp_path.glob("mobo.db.pre-v3-*.bak")) == backups
 
 
 def test_instance_lock_rejects_a_second_owner(tmp_path):

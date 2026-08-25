@@ -360,7 +360,27 @@ CREATE INDEX IF NOT EXISTS idx_bot_experiences_scope
 ON bot_experiences(guild_id, importance DESC, updated_at DESC);
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((2, MIGRATION_2),)
+MIGRATION_3 = """
+CREATE TABLE IF NOT EXISTS guild_personas (
+    guild_id TEXT PRIMARY KEY REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    system_prompt TEXT NOT NULL CHECK(length(trim(system_prompt)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO guild_personas(guild_id, system_prompt, created_at, updated_at)
+SELECT guild_id, trim(system_prompt), updated_at, updated_at
+FROM guilds
+WHERE system_prompt IS NOT NULL AND length(trim(system_prompt)) > 0;
+
+UPDATE guilds SET system_prompt = NULL WHERE system_prompt IS NOT NULL;
+
+DELETE FROM channel_settings
+WHERE listen_enabled = 0 AND proactive_enabled = 0;
+"""
+
+
+MIGRATIONS: tuple[tuple[int, str], ...] = ((2, MIGRATION_2), (3, MIGRATION_3))
 
 
 def utcnow() -> datetime:

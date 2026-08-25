@@ -389,7 +389,7 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         config = await self.runtime.all()
         guild = await self.database.fetchone(
-            "SELECT system_prompt FROM guilds WHERE guild_id = ?", (guild_id,)
+            "SELECT system_prompt FROM guild_personas WHERE guild_id = ?", (guild_id,)
         )
         persona = (guild or {}).get("system_prompt") or config["system_prompt"]
 

@@ -36,6 +36,11 @@ class BotStatus:
     connected: bool = False
     ready: bool = False
     user_tag: str = "尚未连接"
+    user_id: str = ""
+    display_name: str = "mobo"
+    avatar_bytes: bytes | None = field(default=None, repr=False)
+    avatar_version: int = 0
+    identity_synced_at: str | None = None
     guild_count: int = 0
     latency_ms: int | None = None
     commands_synced_at: str | None = None
@@ -47,6 +52,11 @@ class BotStatus:
             "connected": self.connected,
             "ready": self.ready,
             "user_tag": self.user_tag,
+            "user_id": self.user_id,
+            "display_name": self.display_name,
+            "avatar_available": self.avatar_bytes is not None,
+            "avatar_version": self.avatar_version,
+            "identity_synced_at": self.identity_synced_at,
             "guild_count": self.guild_count,
             "latency_ms": self.latency_ms,
             "commands_synced_at": self.commands_synced_at,

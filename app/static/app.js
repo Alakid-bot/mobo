@@ -45,6 +45,39 @@
     document.querySelector("#sidebar")?.classList.toggle("open");
   });
 
+  const identityCard = document.querySelector("[data-refresh-bot-identity]");
+  const identityAvatar = identityCard?.querySelector("[data-bot-avatar]");
+  identityAvatar?.addEventListener("error", () => {
+    identityAvatar.hidden = true;
+    const fallback = identityCard.querySelector("[data-bot-avatar-fallback]");
+    if (fallback) fallback.hidden = false;
+  });
+  identityCard?.addEventListener("click", async () => {
+    identityCard.disabled = true;
+    try {
+      const result = await api("/api/discord/identity/refresh", "POST");
+      const identity = result.identity;
+      identityCard.querySelector("[data-bot-display-name]").textContent = identity.display_name;
+      identityCard.querySelector("[data-bot-tag]").textContent = identity.user_tag;
+      if (identity.avatar_available && identityAvatar) {
+        identityAvatar.src = `/api/discord/identity/avatar?v=${identity.avatar_version}`;
+        identityAvatar.hidden = false;
+        const fallback = identityCard.querySelector("[data-bot-avatar-fallback]");
+        if (fallback) fallback.hidden = true;
+      }
+      const guilds = result.guilds;
+      const summary = `Bot 身份已刷新；${guilds.synced} 个服务器已清除独立外观，${guilds.unchanged} 个原本已同步`;
+      notify(
+        guilds.failed ? `${summary}，${guilds.failed} 个服务器因权限不足未完成` : summary,
+        guilds.failed ? "error" : "success",
+      );
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      identityCard.disabled = false;
+    }
+  });
+
   const settingsForm = document.querySelector("#settings-form");
   if (settingsForm) {
     const dirtyState = document.querySelector("[data-dirty-state]");
@@ -97,33 +130,67 @@
     });
   }
 
-  document.querySelectorAll("[data-save-channel]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const row = button.closest("[data-channel-row]");
-      const listen = row.querySelector("[data-channel-listen]").checked;
-      const proactive = row.querySelector("[data-channel-proactive]").checked;
-      button.disabled = true;
-      try {
-        await api("/api/channels", "POST", {
-          guild_id: row.dataset.guildId,
-          channel_id: row.dataset.channelId,
-          channel_name: row.dataset.channelName,
-          listen_enabled: listen,
-          proactive_enabled: proactive,
-        });
-        notify(`#${row.dataset.channelName} 的策略已保存`);
-      } catch (error) {
-        notify(error.message, "error");
-      } finally {
-        button.disabled = false;
-      }
+  const channelPolicyForm = document.querySelector("#channel-policy-form");
+  const channelGuildSelect = channelPolicyForm?.querySelector("[data-channel-guild]");
+  const channelSelect = channelPolicyForm?.querySelector("[data-channel-select]");
+  const availableChannels = channelSelect
+    ? Array.from(channelSelect.querySelectorAll("option[data-guild-id]")).map((option) => ({
+        guildId: option.dataset.guildId,
+        channelId: option.value,
+        channelName: option.dataset.channelName,
+        label: option.textContent,
+      }))
+    : [];
+
+  function refreshChannelOptions() {
+    if (!channelSelect || !channelGuildSelect) return;
+    const choices = availableChannels.filter((item) => item.guildId === channelGuildSelect.value);
+    channelSelect.replaceChildren(
+      new Option(choices.length ? "选择文字频道" : "该服务器没有可用文字频道", ""),
+    );
+    choices.forEach((item) => {
+      const option = new Option(item.label, item.channelId);
+      option.dataset.channelName = item.channelName;
+      channelSelect.append(option);
     });
+    channelSelect.disabled = choices.length === 0;
+  }
+
+  channelGuildSelect?.addEventListener("change", refreshChannelOptions);
+  refreshChannelOptions();
+  channelPolicyForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(channelPolicyForm);
+    const selected = channelSelect?.selectedOptions[0];
+    const button = event.submitter || channelPolicyForm.querySelector("button[type=submit]");
+    if (button) button.disabled = true;
+    try {
+      await api("/api/channels", "POST", {
+        guild_id: form.get("guild_id"),
+        channel_id: form.get("channel_id"),
+        channel_name: selected?.dataset.channelName || "",
+        mode: form.get("mode"),
+      });
+      notify("频道授权已更新");
+      window.setTimeout(() => window.location.reload(), 350);
+    } catch (error) {
+      notify(error.message, "error");
+      if (button) button.disabled = false;
+    }
   });
 
-  document.querySelectorAll("[data-channel-proactive]").forEach((input) => {
-    input.addEventListener("change", () => {
-      if (input.checked) {
-        input.closest("[data-channel-row]").querySelector("[data-channel-listen]").checked = true;
+  document.querySelectorAll("[data-delete-channel-setting]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const row = button.closest("[data-channel-setting]");
+      if (!window.confirm("恢复后，mobo 只会在被艾特或回复时响应。确定继续吗？")) return;
+      button.disabled = true;
+      try {
+        await api(`/api/channels/${row.dataset.guildId}/${row.dataset.channelId}`, "DELETE");
+        row.remove();
+        notify("频道已恢复为仅直接响应");
+      } catch (error) {
+        notify(error.message, "error");
+        button.disabled = false;
       }
     });
   });
@@ -223,13 +290,35 @@
   document.querySelectorAll("[data-guild-persona]").forEach((form) => {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const data = new FormData(form);
+      const guildId = form.dataset.guildId || data.get("guild_id");
+      const button = event.submitter || form.querySelector("button[type=submit]");
+      if (button) button.disabled = true;
       try {
-        await api(`/api/guilds/${form.dataset.guildId}/persona`, "POST", {
-          system_prompt: new FormData(form).get("system_prompt"),
+        await api(`/api/guilds/${guildId}/persona`, "POST", {
+          system_prompt: data.get("system_prompt"),
         });
         notify("服务器人设已保存");
+        window.setTimeout(() => window.location.reload(), 350);
       } catch (error) {
         notify(error.message, "error");
+        if (button) button.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-delete-guild-persona]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const form = button.closest("[data-guild-persona]");
+      if (!window.confirm("删除后，这个服务器会立即恢复全局核心人设。确定删除吗？")) return;
+      button.disabled = true;
+      try {
+        await api(`/api/guilds/${form.dataset.guildId}/persona`, "DELETE");
+        form.remove();
+        notify("服务器人设覆盖已删除");
+      } catch (error) {
+        notify(error.message, "error");
+        button.disabled = false;
       }
     });
   });

@@ -6,17 +6,22 @@
 
 <section class="panel" id="channels">
   <div class="panel-head"><div><p class="eyebrow">CHANNEL POLICY</p><h2>频道授权</h2></div><span class="status-chip {{ 'on' if config.proactive_global_enabled else '' }}">全局主动发言 {{ '开' if config.proactive_global_enabled else '关' }}</span></div>
-  <p class="panel-intro">“监听”允许机器人把该频道纳入主动参与评估；“主动”必须同时打开监听。被提及和回复机器人的正常对话不受此列表限制。</p>
-  <div class="channel-table">
-    <div class="channel-row header"><span>服务器 / 频道</span><span>监听</span><span>主动</span><span>状态</span></div>
-    {% for channel in channels %}
-    <div class="channel-row" data-channel-row data-guild-id="{{ channel.guild_id }}" data-channel-id="{{ channel.channel_id }}" data-channel-name="{{ channel.channel_name }}">
+  <p class="panel-intro">先选择服务器和频道，再选择它能使用多少上下文。“仅直接响应”仍允许艾特和回复，但不会保存频道上下文；主动参与必须同时允许上下文。</p>
+  <form id="channel-policy-form" class="channel-policy-form">
+    <label>服务器<select name="guild_id" data-channel-guild required><option value="">选择服务器</option>{% for guild in guilds %}<option value="{{ guild.guild_id }}">{{ guild.name }}</option>{% endfor %}</select></label>
+    <label>文字频道<select name="channel_id" data-channel-select required disabled><option value="">先选择服务器</option>{% for channel in channels %}<option value="{{ channel.channel_id }}" data-guild-id="{{ channel.guild_id }}" data-channel-name="{{ channel.channel_name }}"># {{ channel.channel_name or channel.channel_id }}</option>{% endfor %}</select></label>
+    <label>授权模式<select name="mode" required><option value="direct">仅直接响应</option><option value="context">读取上下文</option><option value="proactive">读取上下文并主动参与</option></select></label>
+    <button class="primary-button" type="submit">保存频道配置</button>
+  </form>
+  <div class="channel-table configured-channels">
+    <div class="channel-row header"><span>已配置频道</span><span>授权模式</span><span>操作</span></div>
+    {% for channel in channel_settings %}
+    <div class="channel-row" data-channel-setting data-guild-id="{{ channel.guild_id }}" data-channel-id="{{ channel.channel_id }}">
       <span><strong>{{ channel.guild_name or channel.guild_id }}</strong><small># {{ channel.channel_name or channel.channel_id }}</small></span>
-      <label class="mini-switch"><input type="checkbox" data-channel-listen {{ 'checked' if channel.listen_enabled else '' }}><i></i></label>
-      <label class="mini-switch"><input type="checkbox" data-channel-proactive {{ 'checked' if channel.proactive_enabled else '' }}><i></i></label>
-      <button class="small-button" type="button" data-save-channel>保存</button>
+      <span class="channel-mode">{{ '读取上下文并主动参与' if channel.proactive_enabled else '读取上下文' }}</span>
+      <button class="danger-link" type="button" data-delete-channel-setting>恢复仅直接响应</button>
     </div>
-    {% else %}<p class="empty">Discord 尚未连接，因此还没有可配置的频道。连接后刷新本页。</p>{% endfor %}
+    {% else %}<p class="empty">目前没有单独授权的频道，所有服务器频道都只在被艾特或回复时响应。</p>{% endfor %}
   </div>
 </section>
 
@@ -66,10 +71,16 @@
 
 <section class="panel">
   <div class="panel-head"><div><p class="eyebrow">SERVER PERSONAS</p><h2>服务器人设覆盖</h2></div><a href="/settings#section-1">编辑全局人设</a></div>
+  <p class="panel-intro">新服务器不会自动创建人设记录。只有手动添加的服务器会覆盖全局人设，删除后立即恢复全局人设。</p>
+  <form id="guild-persona-form" class="persona-create-form" data-guild-persona>
+    <label>服务器<select name="guild_id" required><option value="">选择服务器</option>{% for guild in guilds %}<option value="{{ guild.guild_id }}">{{ guild.name }}</option>{% endfor %}</select></label>
+    <label>人设提示词<textarea name="system_prompt" rows="3" maxlength="4000" required placeholder="填写这个服务器独有的说话方式、关系或背景"></textarea></label>
+    <button class="primary-button" type="submit">添加或覆盖</button>
+  </form>
   <div class="guild-personas">
-    {% for guild in guilds %}
-    <form data-guild-persona data-guild-id="{{ guild.guild_id }}"><div><strong>{{ guild.name }}</strong><small>{{ guild.guild_id }}</small></div><textarea name="system_prompt" rows="3" placeholder="留空则使用全局核心人设">{{ guild.system_prompt or '' }}</textarea><button class="small-button" type="submit">保存</button></form>
-    {% else %}<p class="empty">尚未发现服务器。</p>{% endfor %}
+    {% for persona in personas %}
+    <form data-guild-persona data-guild-id="{{ persona.guild_id }}"><div><strong>{{ persona.name }}</strong><small>{{ persona.guild_id }}</small></div><textarea name="system_prompt" rows="3" maxlength="4000" required>{{ persona.system_prompt }}</textarea><span class="persona-actions"><button class="small-button" type="submit">保存</button><button class="danger-link" type="button" data-delete-guild-persona>删除</button></span></form>
+    {% else %}<p class="empty">还没有服务器人设覆盖，所有服务器都在使用全局核心人设。</p>{% endfor %}
   </div>
 </section>
 {% endblock %}

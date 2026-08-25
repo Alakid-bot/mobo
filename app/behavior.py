@@ -44,6 +44,11 @@ class ChannelSettingsService:
         listen_enabled: bool,
         proactive_enabled: bool,
     ) -> None:
+        if proactive_enabled and not listen_enabled:
+            raise ValueError("主动发言依赖频道上下文")
+        if not listen_enabled and not proactive_enabled:
+            await self.delete(guild_id, channel_id)
+            return
         await self.database.execute(
             """INSERT INTO channel_settings
                (guild_id, channel_id, channel_name, listen_enabled,
@@ -64,12 +69,25 @@ class ChannelSettingsService:
             ),
         )
 
+    async def delete(self, guild_id: str, channel_id: str) -> bool:
+        return bool(
+            await self.database.execute(
+                "DELETE FROM channel_settings WHERE guild_id = ? AND channel_id = ?",
+                (guild_id, channel_id),
+            )
+        )
+
     async def list(self) -> list[dict[str, Any]]:
-        return await self.database.fetchall(
+        rows = await self.database.fetchall(
             """SELECT c.*, g.name AS guild_name FROM channel_settings c
                LEFT JOIN guilds g ON g.guild_id = c.guild_id
+               WHERE c.listen_enabled = 1
                ORDER BY g.name, c.channel_name"""
         )
+        for row in rows:
+            row["listen_enabled"] = bool(row["listen_enabled"])
+            row["proactive_enabled"] = bool(row["proactive_enabled"])
+        return rows
 
 
 @dataclass(frozen=True)

@@ -55,7 +55,7 @@
 | `admins` / `admin_sessions` | 管理密码、哈希会话与 CSRF | 管理台 |
 | `discord_admins` | 管理命令 Discord ID 白名单 | 全局 |
 | `app_settings` | 可视化运行配置；密钥字段加密 | 全局 |
-| `guilds` / `channel_settings` | 服务器人设与监听/主动开关 | 服务器/频道 |
+| `guilds` / `guild_personas` / `channel_settings` | 服务器元数据、显式人设覆盖与频道授权策略 | 服务器/频道 |
 | `messages` / `channel_summaries` | 有限期频道上下文与兼容摘要 | 服务器/频道 |
 | `user_profiles` / `manual_memories` | 明确纠正的画像与一条主动关键词 | 用户全局 |
 | `memories` / `memory_terms` | 自动长期记忆与关键词倒排索引 | 服务器/用户 |

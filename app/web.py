@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -220,6 +220,51 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             },
             status_code=200 if healthy else 503,
         )
+
+    @app.get("/api/discord/identity/avatar")
+    async def discord_identity_avatar(request: Request):
+        required = await require_api_read_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        avatar = state.bot_status.avatar_bytes
+        if avatar is None:
+            return Response(status_code=404)
+        return Response(content=avatar, media_type="image/png")
+
+    @app.post("/api/discord/identity/refresh")
+    async def refresh_discord_identity(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        bot = state.discord_bot
+        if bot is None or not state.bot_status.ready:
+            return JSONResponse({"ok": False, "error": "Discord 尚未连接"}, status_code=503)
+        try:
+            guild_result = await bot.refresh_identity(sync_guilds=True)
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+        except Exception:
+            log.exception("Discord identity refresh failed")
+            return JSONResponse(
+                {"ok": False, "error": "Discord 身份同步失败，请稍后重试"}, status_code=502
+            )
+        await state.database.audit(
+            required.username,
+            "discord.identity_refresh",
+            target=state.bot_status.user_id,
+            details={
+                "guilds_total": guild_result["total"],
+                "guilds_synced": guild_result["synced"],
+                "guilds_unchanged": guild_result["unchanged"],
+                "guilds_failed": guild_result["failed"],
+            },
+            ip_address=client_ip(request),
+        )
+        return {
+            "ok": True,
+            "identity": state.bot_status.as_dict(),
+            "guilds": guild_result,
+        }
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page(request: Request):
@@ -848,8 +893,15 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         context["preferences"] = await state.preferences.list(100)
         context["mood"] = await state.mood.current(await state.runtime.all())
         context["guilds"] = await state.database.fetchall(
-            "SELECT guild_id, name, system_prompt, updated_at FROM guilds ORDER BY name"
+            "SELECT guild_id, name, updated_at FROM guilds ORDER BY name"
         )
+        context["personas"] = await state.database.fetchall(
+            """SELECT p.guild_id, g.name, p.system_prompt, p.created_at, p.updated_at
+               FROM guild_personas p
+               JOIN guilds g ON g.guild_id = p.guild_id
+               ORDER BY g.name"""
+        )
+        context["channel_settings"] = await state.channels.list()
         context["experiences"] = await state.database.fetchall(
             """SELECT e.*, g.name AS guild_name FROM bot_experiences e
                LEFT JOIN guilds g ON g.guild_id = e.guild_id
@@ -865,8 +917,19 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         if isinstance(required, JSONResponse):
             return required
         payload = await request.json()
-        listen = bool(payload.get("listen_enabled"))
-        proactive = bool(payload.get("proactive_enabled"))
+        mode = payload.get("mode")
+        if mode is not None:
+            policies = {
+                "direct": (False, False),
+                "context": (True, False),
+                "proactive": (True, True),
+            }
+            if mode not in policies:
+                return JSONResponse({"ok": False, "error": "频道授权模式无效"}, status_code=422)
+            listen, proactive = policies[mode]
+        else:
+            listen = bool(payload.get("listen_enabled"))
+            proactive = bool(payload.get("proactive_enabled"))
         if proactive and not listen:
             return JSONResponse({"ok": False, "error": "主动发言依赖频道监听"}, status_code=422)
         try:
@@ -886,6 +949,24 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             "channel.settings_update",
             target=f"{guild_id}:{channel_id}",
             details={"listen": listen, "proactive": proactive},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True}
+
+    @app.delete("/api/channels/{guild_id}/{channel_id}")
+    async def delete_channel_setting(guild_id: str, channel_id: str, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        if not guild_id.isdigit() or not channel_id.isdigit():
+            return JSONResponse({"ok": False, "error": "服务器或频道 ID 无效"}, status_code=422)
+        changed = await state.channels.delete(guild_id, channel_id)
+        if not changed:
+            return JSONResponse({"ok": False, "error": "频道没有单独配置"}, status_code=404)
+        await state.database.audit(
+            required.username,
+            "channel.settings_delete",
+            target=f"{guild_id}:{channel_id}",
             ip_address=client_ip(request),
         )
         return {"ok": True}
@@ -1012,19 +1093,48 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         if isinstance(required, JSONResponse):
             return required
         payload = await request.json()
-        prompt = str(payload.get("system_prompt", "")).strip()[:4000] or None
+        prompt = str(payload.get("system_prompt", "")).strip()[:4000]
+        if not prompt:
+            return JSONResponse(
+                {"ok": False, "error": "服务器人设不能为空；如需恢复全局人设，请点击删除"},
+                status_code=422,
+            )
         row = await state.database.fetchone(
             "SELECT name FROM guilds WHERE guild_id = ?", (guild_id,)
         )
         if not row:
             return JSONResponse({"ok": False, "error": "服务器不存在"}, status_code=404)
+        now = iso_now()
         await state.database.execute(
-            "UPDATE guilds SET system_prompt = ?, updated_at = ? WHERE guild_id = ?",
-            (prompt, iso_now(), guild_id),
+            """INSERT INTO guild_personas(guild_id, system_prompt, created_at, updated_at)
+               VALUES(?, ?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                 system_prompt = excluded.system_prompt, updated_at = excluded.updated_at""",
+            (guild_id, prompt, now, now),
         )
         await state.database.audit(
             required.username,
             "guild.persona_update",
+            target=guild_id,
+            ip_address=client_ip(request),
+        )
+        return {"ok": True}
+
+    @app.delete("/api/guilds/{guild_id}/persona")
+    async def delete_guild_persona(guild_id: str, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        if not guild_id.isdigit():
+            return JSONResponse({"ok": False, "error": "服务器 ID 无效"}, status_code=422)
+        changed = await state.database.execute(
+            "DELETE FROM guild_personas WHERE guild_id = ?", (guild_id,)
+        )
+        if not changed:
+            return JSONResponse({"ok": False, "error": "服务器没有人设覆盖"}, status_code=404)
+        await state.database.audit(
+            required.username,
+            "guild.persona_delete",
             target=guild_id,
             ip_address=client_ip(request),
         )

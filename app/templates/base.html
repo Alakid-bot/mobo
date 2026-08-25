@@ -25,10 +25,15 @@
         <a href="/security" class="nav-item {{ 'active' if page == 'security' else '' }}"><span>安全与权限</span><em>07</em></a>
       </nav>
       <div class="sidebar-foot">
-        <div class="connection-card">
-          <span class="pulse {{ 'online' if bot_status.ready else '' }}"></span>
-          <div><strong>{{ 'Discord 已连接' if bot_status.ready else 'Discord 启动中' }}</strong><small>{{ bot_status.user_tag }}</small></div>
-        </div>
+        <button class="connection-card" type="button" data-refresh-bot-identity aria-label="刷新 Discord Bot 身份并同步服务器外观" title="从 Discord 刷新 Bot 身份，并同步所有已安装服务器">
+          <span class="bot-avatar-shell">
+            <img data-bot-avatar src="/api/discord/identity/avatar?v={{ bot_status.avatar_version }}" alt="{{ bot_status.display_name }} 的头像" {{ 'hidden' if not bot_status.avatar_available else '' }}>
+            <span data-bot-avatar-fallback {{ 'hidden' if bot_status.avatar_available else '' }}>mo</span>
+            <i class="pulse {{ 'online' if bot_status.ready else '' }}"></i>
+          </span>
+          <span class="connection-copy"><strong data-bot-display-name>{{ bot_status.display_name if bot_status.ready else 'Discord 启动中' }}</strong><small data-bot-tag>{{ bot_status.user_tag }}</small></span>
+          <span class="sync-glyph" aria-hidden="true">↻</span>
+        </button>
         <form action="/logout" method="post">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="text-button" type="submit">退出管理台</button>
