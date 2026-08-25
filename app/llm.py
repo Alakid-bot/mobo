@@ -48,6 +48,7 @@ class ModelResult:
     provider: str
     model: str
     usage_estimated: bool = True
+    tool_calls: tuple[dict[str, Any], ...] | None = None
 
 
 def sanitize_error(error: BaseException | str, *, secrets: Iterable[str] = ()) -> str:
@@ -123,7 +124,12 @@ class LLMBackend(ABC):
             parts.append(part)
         return "".join(parts)
 
-    async def complete_result(self, messages: list[dict[str, Any]]) -> ModelResult:
+    async def complete_result(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ModelResult:
         started = time.perf_counter()
         text = await self.complete(messages)
         return ModelResult(
@@ -190,22 +196,46 @@ class OpenAICompatibleBackend(LLMBackend):
         except Exception as exc:
             raise LLMProviderError(sanitize_error(exc, secrets=(self._api_key,))) from None
 
-    async def complete_result(self, messages: list[dict[str, Any]]) -> ModelResult:
+    async def complete_result(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ModelResult:
         started = time.perf_counter()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": False,
+            **self._token_limit(),
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                stream=False,
-                **self._token_limit(),
-            )
+            response = await self.client.chat.completions.create(**kwargs)
         except TimeoutError as exc:
             raise TimeoutError(sanitize_error(exc, secrets=(self._api_key,))) from None
         except Exception as exc:
             raise LLMProviderError(sanitize_error(exc, secrets=(self._api_key,))) from None
         choices = getattr(response, "choices", None) or []
-        text = _content_text(choices[0].message.content) if choices else ""
+        message = choices[0].message if choices else None
+        text = _content_text(getattr(message, "content", None) if message else None)
+        raw_tool_calls = getattr(message, "tool_calls", None) if message else None
+        parsed_tool_calls: tuple[dict[str, Any], ...] | None = None
+        if raw_tool_calls:
+            parsed = []
+            for tc in raw_tool_calls:
+                func = getattr(tc, "function", None)
+                parsed.append({
+                    "id": str(getattr(tc, "id", "")),
+                    "type": str(getattr(tc, "type", "function")),
+                    "function": {
+                        "name": str(getattr(func, "name", "") if func else ""),
+                        "arguments": str(getattr(func, "arguments", "") if func else ""),
+                    },
+                })
+            parsed_tool_calls = tuple(parsed)
         usage = getattr(response, "usage", None)
         input_tokens = _usage_value(usage, "prompt_tokens", "input_tokens")
         output_tokens = _usage_value(usage, "completion_tokens", "output_tokens")
@@ -218,6 +248,7 @@ class OpenAICompatibleBackend(LLMBackend):
             provider=self.provider,
             model=self.model,
             usage_estimated=estimated,
+            tool_calls=parsed_tool_calls,
         )
 
 
@@ -341,8 +372,11 @@ class ModelGateway:
         messages: list[dict[str, Any]],
         *,
         role: ModelRole = "chat",
+        tools: list[dict[str, Any]] | None = None,
     ) -> ModelResult:
-        return await self.build_backend(config, role=role).complete_result(messages)
+        return await self.build_backend(config, role=role).complete_result(
+            messages, tools=tools
+        )
 
     async def stream(
         self,

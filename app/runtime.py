@@ -801,6 +801,35 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
         "👍,😂,❤️,🤔",
         "逗号分隔的表情列表，随机选取一个。",
     ),
+    # ── Phase 3：工具桥 ─────────────────────────────────────────────────
+    SettingField(
+        "tools_enabled_global",
+        "工具桥总开关",
+        "工具桥",
+        "toggle",
+        False,
+        "开启后，已授权服务器可使用内部 API 桥接工具。",
+    ),
+    SettingField(
+        "guild_tools_enabled",
+        "各服务器工具开关",
+        "工具桥",
+        "textarea",
+        "{}",
+        "JSON 对象，key 为服务器 ID，value 为 true/false。例：{\"123456\": true}",
+    ),
+    SettingField(
+        "bridge_endpoints",
+        "桥接端点配置",
+        "工具桥",
+        "secret",
+        "[]",
+        (
+            "JSON 数组，每项包含：名称、URL、method、请求模板（{input} 占位）、"
+            "鉴权头、响应字段路径、超时秒数。鉴权头会加密存储。"
+        ),
+        secret=True,
+    ),
 )
 
 

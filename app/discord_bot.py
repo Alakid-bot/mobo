@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random as _random
 import re
@@ -1311,7 +1312,53 @@ class MoboBot(commands.Bot):
             self._inject_burst_context(context, payload.burst_context)
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
-            result = await self.state.llm.complete(payload.config, context, role=role)
+            # ── 工具桥：有界 agent 循环（仅当工具启用时） ────────────
+            from app.agent import (
+                agent_loop,
+                build_tools,
+                tools_enabled_for_guild,
+            )
+
+            if tools_enabled_for_guild(payload.config, payload.guild_id):
+                try:
+                    bridge_raw = payload.config.get("bridge_endpoints", "[]")
+                    bridge_endpoints = (
+                        json.loads(bridge_raw) if isinstance(bridge_raw, str) else bridge_raw
+                    )
+                    if not isinstance(bridge_endpoints, list):
+                        bridge_endpoints = []
+                except (json.JSONDecodeError, TypeError):
+                    bridge_endpoints = []
+                tool_registry = build_tools(
+                    bridge_endpoints,
+                    audit_fn=self.state.database.audit,
+                    actor=f"discord:{payload.user_id}",
+                )
+                if tool_registry:
+                    try:
+                        result = await agent_loop(
+                            self.state.llm,
+                            payload.config,
+                            context,
+                            tool_registry=tool_registry,
+                            role=role,
+                            audit_fn=self.state.database.audit,
+                            actor=f"discord:{payload.user_id}",
+                            guild_id=payload.guild_id,
+                        )
+                    except Exception:
+                        log.warning("agent 循环异常，降级为无工具模式", exc_info=True)
+                        result = await self.state.llm.complete(
+                            payload.config, context, role=role
+                        )
+                else:
+                    result = await self.state.llm.complete(
+                        payload.config, context, role=role
+                    )
+            else:
+                result = await self.state.llm.complete(
+                    payload.config, context, role=role
+                )
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
             result = self._coerce_model_result(result, payload.config, context)
