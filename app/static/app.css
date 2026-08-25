@@ -147,12 +147,13 @@ input, select { min-height: 42px; }
 textarea { resize: vertical; line-height: 1.55; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(229,165,75,.09); }
 select { appearance: auto; }
-.switch { min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border: 1px solid var(--line); background: #111316; cursor: pointer; }
-.switch input, .mini-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch { position: relative; min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border: 1px solid var(--line); background: #111316; cursor: pointer; }
+.switch input, .mini-switch input { position: absolute; width: 1px; height: 1px; min-height: 0; margin: 0; opacity: 0; overflow: hidden; pointer-events: none; }
 .switch i, .mini-switch i { position: relative; display: inline-block; width: 33px; height: 17px; border-radius: 10px; background: var(--surface-3); transition: .15s; }
 .switch i::after, .mini-switch i::after { content: ""; position: absolute; width: 11px; height: 11px; left: 3px; top: 3px; border-radius: 50%; background: var(--muted); transition: .15s; }
 .switch input:checked + i, .mini-switch input:checked + i { background: rgba(229,165,75,.25); }
 .switch input:checked + i::after, .mini-switch input:checked + i::after { left: 19px; background: var(--accent-strong); }
+.switch input:focus-visible + i, .mini-switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 3px; }
 .switch b { font-size: 11px; font-weight: 500; color: var(--muted); }
 .secret-input { position: relative; }
 .secret-input input { padding-right: 58px; }
@@ -170,7 +171,7 @@ select { appearance: auto; }
 .channel-row > span strong, .channel-row > span small { display: block; }
 .channel-row > span strong { font-size: 12px; }
 .channel-row > span small { color: var(--dim); font-size: 10px; margin-top: 3px; }
-.mini-switch { cursor: pointer; height: 25px; display: flex; align-items: center; }
+.mini-switch { position: relative; cursor: pointer; height: 25px; display: flex; align-items: center; }
 
 .inline-editor { display: grid; grid-template-columns: 1fr 1.5fr 90px; gap: 12px; padding-bottom: 25px; border-bottom: 1px solid var(--line); }
 .inline-editor label { color: var(--muted); font-size: 10px; }

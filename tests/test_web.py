@@ -85,8 +85,52 @@ async def test_settings_api_requires_session_and_csrf(state):
             json={"values": {"llm_model": "test-model"}},
             headers={"X-CSRF-Token": csrf},
         )
+        assert response.status_code == 400
+        assert "模型中心" in response.json()["error"]
+        assert await state.runtime.get("llm_model") == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_settings_api_cannot_bypass_model_center_but_allows_model_tuning(state):
+    app = create_web_app(state)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        await login(client)
+        csrf = await csrf_from(client)
+        page = await client.get("/settings")
+        assert 'data-key="llm_model"' not in page.text
+        assert "模型中心" in page.text
+
+        response = await client.post(
+            "/api/settings",
+            json={
+                "values": {
+                    "llm_provider": "openrouter",
+                    "llm_model": "forged-model",
+                    "llm_deep_model": "forged-deep",
+                    "llm_utility_model": "forged-utility",
+                    "llm_temperature": "0.2",
+                }
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert response.status_code == 400
+        assert "模型中心" in response.json()["error"]
+        assert await state.runtime.get("llm_provider") == "openai"
+        assert await state.runtime.get("llm_model") == "gpt-4o-mini"
+        assert await state.runtime.get("llm_deep_model") == ""
+        assert await state.runtime.get("llm_utility_model") == ""
+        assert await state.runtime.get("llm_temperature") == 0.8
+
+        response = await client.post(
+            "/api/settings",
+            json={"values": {"llm_temperature": "0.2", "openai_base_url": "https://proxy.test/v1"}},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert response.status_code == 200
-        assert response.json()["values"]["llm_model"] == "test-model"
+        assert await state.runtime.get("llm_temperature") == 0.2
+        assert await state.runtime.get("openai_base_url") == "https://proxy.test/v1"
 
 
 @pytest.mark.asyncio

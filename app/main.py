@@ -6,11 +6,13 @@ import logging
 import signal
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import uvicorn
 
 from app.config import settings
 from app.discord_bot import create_bot
+from app.instance_lock import InstanceLock
 from app.state import create_state
 from app.web import create_web_app
 
@@ -42,6 +44,8 @@ def configure_logging() -> None:
 async def run() -> None:
     configure_logging()
     log = logging.getLogger("mobo")
+    instance_lock = InstanceLock(Path(settings.db_path).with_name("mobo.instance.lock"))
+    instance_lock.acquire()
     state = await create_state(settings)
     web_app = create_web_app(state)
     bot = create_bot(state)
@@ -52,8 +56,10 @@ async def run() -> None:
             port=settings.web_port,
             log_level=settings.log_level.lower(),
             access_log=False,
-            proxy_headers=True,
-            forwarded_allow_ips="*",
+            # No trusted proxy ranges are configured, so forwarded client and
+            # scheme headers must not influence the ASGI scope.
+            proxy_headers=False,
+            forwarded_allow_ips="",
         )
     )
     # The parent coroutine owns signal handling so bot and web stop together.
@@ -71,8 +77,23 @@ async def run() -> None:
             signal.signal(signame, lambda *_: loop.call_soon_threadsafe(request_stop))
 
     async def run_bot() -> None:
-        async with bot:
-            await bot.start(settings.discord_token.get_secret_value())
+        try:
+            async with bot:
+                await bot.start(settings.discord_token.get_secret_value())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Keep the private console alive so a Discord token/configuration problem is diagnosable.
+            state.bot_status.connected = False
+            state.bot_status.ready = False
+            state.bot_status.last_error = type(exc).__name__
+            log.exception("Discord 连接失败；管理台将保持可用，修正配置后请重新部署")
+            await stop_event.wait()
+        else:
+            state.bot_status.connected = False
+            state.bot_status.ready = False
+            state.bot_status.last_error = "DiscordStopped"
+            await stop_event.wait()
 
     web_task = asyncio.create_task(server.serve(), name="mobo-web")
     bot_task = asyncio.create_task(run_bot(), name="mobo-discord")
@@ -98,6 +119,9 @@ async def run() -> None:
         if not task.done():
             task.cancel()
     await asyncio.gather(web_task, bot_task, stop_task, return_exceptions=True)
+    await state.llm.close()
+    await state.database.close()
+    instance_lock.release()
     if failure:
         raise failure
     log.info("mobo 已安全停止")

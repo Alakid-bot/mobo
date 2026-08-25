@@ -10,3 +10,5 @@ data/
 *.db
 *.db-shm
 *.db-wal
+*.db.pre-v*.bak
+*.instance.lock

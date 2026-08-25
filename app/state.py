@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from app.admin_access import DiscordAdminService
 from app.auth import AuthManager
 from app.behavior import ChannelSettingsService, ProactiveService
 from app.cognition import (
@@ -15,8 +16,19 @@ from app.cognition import (
 from app.config import BootstrapSettings
 from app.crypto import SecretCipher
 from app.database import Database, utcnow
+from app.intelligence import (
+    BotExperienceService,
+    CorrectionService,
+    FeedbackService,
+    FollowupService,
+    IntentService,
+    UsageService,
+)
+from app.llm import ModelGateway
 from app.memory import MemoryService
+from app.model_activation import ModelActivationService
 from app.runtime import RuntimeSettings
+from app.safety import SafetyEngine
 
 
 @dataclass
@@ -56,6 +68,16 @@ class ApplicationState:
     channels: ChannelSettingsService
     proactive: ProactiveService
     context: ContextBuilder
+    discord_admins: DiscordAdminService
+    llm: ModelGateway
+    model_activation: ModelActivationService
+    safety: SafetyEngine
+    intents: IntentService
+    corrections: CorrectionService
+    followups: FollowupService
+    feedback: FeedbackService
+    usage: UsageService
+    experiences: BotExperienceService
     bot_status: BotStatus = field(default_factory=BotStatus)
     discord_bot: Any = None
 
@@ -79,12 +101,23 @@ async def create_state(bootstrap: BootstrapSettings) -> ApplicationState:
         )
 
     memories = MemoryService(database)
+    await memories.rebuild_legacy_index()
     relationships = RelationshipService(database)
     preferences = PreferenceService(database)
     mood = MoodService(database)
     channels = ChannelSettingsService(database)
     proactive = ProactiveService(database, channels, relationships, preferences, mood)
     context = ContextBuilder(database, runtime, memories, relationships, preferences, mood)
+    discord_admins = DiscordAdminService(database)
+    llm = ModelGateway()
+    model_activation = ModelActivationService(runtime, llm)
+    safety = SafetyEngine(runtime, database)
+    intents = IntentService()
+    corrections = CorrectionService(database)
+    followups = FollowupService(database)
+    feedback = FeedbackService(database)
+    usage = UsageService(database)
+    experiences = BotExperienceService(database)
     return ApplicationState(
         bootstrap=bootstrap,
         database=database,
@@ -97,4 +130,14 @@ async def create_state(bootstrap: BootstrapSettings) -> ApplicationState:
         channels=channels,
         proactive=proactive,
         context=context,
+        discord_admins=discord_admins,
+        llm=llm,
+        model_activation=model_activation,
+        safety=safety,
+        intents=intents,
+        corrections=corrections,
+        followups=followups,
+        feedback=feedback,
+        usage=usage,
+        experiences=experiences,
     )

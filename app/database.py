@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -171,6 +173,196 @@ ON audit_log(created_at DESC);
 """
 
 
+MIGRATION_2 = """
+CREATE TABLE IF NOT EXISTS discord_admins (
+    user_id TEXT PRIMARY KEY,
+    note TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    style_json TEXT NOT NULL DEFAULT '{}',
+    boundaries_json TEXT NOT NULL DEFAULT '{}',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    interaction_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS manual_memories (
+    user_id TEXT PRIMARY KEY,
+    keywords_json TEXT NOT NULL DEFAULT '[]',
+    normalized_text TEXT NOT NULL DEFAULT '',
+    char_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_terms (
+    memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    term TEXT NOT NULL,
+    PRIMARY KEY (memory_id, term)
+);
+
+CREATE TABLE IF NOT EXISTS open_loops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    public_safe INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'closed', 'expired')),
+    followup_after TEXT,
+    expires_at TEXT,
+    followup_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_events (
+    message_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    origin_user_id TEXT,
+    guild_id TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, user_id, emoji)
+);
+
+CREATE TABLE IF NOT EXISTS safety_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'custom',
+    direction TEXT NOT NULL DEFAULT 'both' CHECK(direction IN ('input', 'output', 'both')),
+    pattern TEXT NOT NULL,
+    match_type TEXT NOT NULL DEFAULT 'contains' CHECK(match_type IN ('contains', 'word', 'regex')),
+    action TEXT NOT NULL DEFAULT 'block' CHECK(action IN ('block', 'redact', 'log')),
+    replacement TEXT NOT NULL DEFAULT '[已隐藏]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS safety_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER REFERENCES safety_rules(id) ON DELETE SET NULL,
+    guild_id TEXT,
+    channel_id TEXT,
+    user_id TEXT,
+    direction TEXT NOT NULL,
+    category TEXT NOT NULL,
+    action TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_catalog_cache (
+    provider TEXT NOT NULL,
+    endpoint_hash TEXT NOT NULL,
+    models_json TEXT NOT NULL DEFAULT '[]',
+    fetched_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_error TEXT,
+    PRIMARY KEY (provider, endpoint_hash)
+);
+
+CREATE TABLE IF NOT EXISTS usage_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    guild_id TEXT,
+    user_id TEXT,
+    provider TEXT,
+    model TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ok',
+    error_code TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    guild_id TEXT,
+    user_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'done', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    run_after TEXT NOT NULL,
+    locked_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS summary_sessions (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    source_start_id TEXT,
+    source_end_id TEXT,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bot_experiences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    source_user_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'experience',
+    content TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    importance REAL NOT NULL DEFAULT 0.5,
+    evidence_count INTEGER NOT NULL DEFAULT 1,
+    locked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT
+);
+
+ALTER TABLE messages ADD COLUMN discord_message_id TEXT;
+ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT;
+ALTER TABLE memories ADD COLUMN normalized_content TEXT NOT NULL DEFAULT '';
+ALTER TABLE memories ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE memories ADD COLUMN last_recalled_at TEXT;
+ALTER TABLE memories ADD COLUMN last_confirmed_at TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_discord_id
+ON messages(guild_id, channel_id, discord_message_id)
+WHERE discord_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memory_terms_lookup
+ON memory_terms(guild_id, user_id, term, memory_id);
+CREATE INDEX IF NOT EXISTS idx_open_loops_due
+ON open_loops(status, followup_after, expires_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_origin
+ON feedback_events(origin_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_safety_rules_active
+ON safety_rules(enabled, direction, priority, id);
+CREATE INDEX IF NOT EXISTS idx_safety_events_time
+ON safety_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_time
+ON usage_metrics(created_at DESC, kind, provider, model);
+CREATE INDEX IF NOT EXISTS idx_jobs_ready
+ON background_jobs(status, run_after, id);
+CREATE INDEX IF NOT EXISTS idx_summary_sessions_expiry
+ON summary_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_bot_experiences_scope
+ON bot_experiences(guild_id, importance DESC, updated_at DESC);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = ((2, MIGRATION_2),)
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -182,20 +374,43 @@ def iso_now() -> str:
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._connection: aiosqlite.Connection | None = None
+        self._connection_lock = asyncio.Lock()
+
+    async def _open(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(self.path)
+            self._connection.row_factory = aiosqlite.Row
+            await self._connection.execute("PRAGMA foreign_keys = ON")
+            await self._connection.execute("PRAGMA busy_timeout = 5000")
+        return self._connection
 
     @asynccontextmanager
     async def connect(self) -> AsyncIterator[aiosqlite.Connection]:
-        connection = await aiosqlite.connect(self.path)
-        connection.row_factory = aiosqlite.Row
-        await connection.execute("PRAGMA foreign_keys = ON")
-        await connection.execute("PRAGMA busy_timeout = 5000")
-        try:
-            yield connection
-        finally:
-            await connection.close()
+        async with self._connection_lock:
+            connection = await self._open()
+            try:
+                yield connection
+            except BaseException:
+                # asyncio.CancelledError inherits BaseException.  Message
+                # generation is intentionally cancellable, so a cancellation
+                # must never leave its SQLite transaction open for the next
+                # request that reuses this persistent connection.
+                try:
+                    if connection.in_transaction:
+                        await asyncio.shield(connection.rollback())
+                finally:
+                    raise
+
+    async def close(self) -> None:
+        async with self._connection_lock:
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
 
     async def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        await self._backup_before_upgrade()
         async with self.connect() as connection:
             await connection.execute("PRAGMA journal_mode = WAL")
             await connection.execute("PRAGMA synchronous = NORMAL")
@@ -205,6 +420,21 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?)",
                 (now,),
             )
+            await connection.commit()
+            applied_rows = await connection.execute_fetchall(
+                "SELECT version FROM schema_migrations"
+            )
+            applied = {int(row[0]) for row in applied_rows}
+            for version, script in MIGRATIONS:
+                if version in applied:
+                    continue
+                escaped_now = now.replace("'", "''")
+                await connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + script
+                    + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES({version}, '{escaped_now}');\n"
+                    + f"PRAGMA user_version = {version};\nCOMMIT;"
+                )
             await connection.execute(
                 """INSERT OR IGNORE INTO mood_state
                    (id, valence, energy, social_budget, label, updated_at)
@@ -228,18 +458,55 @@ class Database:
             await connection.execute("PRAGMA optimize")
             await connection.commit()
 
+    async def _backup_before_upgrade(self) -> Path | None:
+        """Create a consistent SQLite backup before a pending schema upgrade."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        target_version = max(version for version, _script in MIGRATIONS)
+
+        def backup() -> Path | None:
+            with sqlite3.connect(self.path) as source:
+                table = source.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+                ).fetchone()
+                current_version = 0
+                if table:
+                    row = source.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                    ).fetchone()
+                    current_version = int(row[0]) if row else 0
+                if current_version >= target_version:
+                    return None
+                stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+                destination = self.path.with_name(
+                    f"{self.path.name}.pre-v{target_version}-{stamp}.bak"
+                )
+                with sqlite3.connect(destination) as output:
+                    source.backup(output)
+                return destination
+
+        return await asyncio.to_thread(backup)
+
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> int:
         async with self.connect() as connection:
-            cursor = await connection.execute(sql, parameters)
-            await connection.commit()
-            if sql.lstrip().upper().startswith("INSERT") and cursor.lastrowid:
-                return int(cursor.lastrowid)
-            return max(0, int(cursor.rowcount))
+            try:
+                cursor = await connection.execute(sql, parameters)
+                await connection.commit()
+                if sql.lstrip().upper().startswith("INSERT") and cursor.lastrowid:
+                    return int(cursor.lastrowid)
+                return max(0, int(cursor.rowcount))
+            except Exception:
+                await connection.rollback()
+                raise
 
     async def executemany(self, sql: str, parameters: Iterable[Sequence[Any]]) -> None:
         async with self.connect() as connection:
-            await connection.executemany(sql, parameters)
-            await connection.commit()
+            try:
+                await connection.executemany(sql, parameters)
+                await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
 
     async def fetchone(self, sql: str, parameters: Sequence[Any] = ()) -> dict[str, Any] | None:
         async with self.connect() as connection:
@@ -268,6 +535,22 @@ class Database:
                 (
                     "memories",
                     "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                ),
+                (
+                    "open_loops",
+                    "DELETE FROM open_loops WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                ),
+                (
+                    "summary_sessions",
+                    "DELETE FROM summary_sessions WHERE expires_at <= ?",
+                ),
+                (
+                    "bot_experiences",
+                    "DELETE FROM bot_experiences WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                ),
+                (
+                    "model_catalog_cache",
+                    "DELETE FROM model_catalog_cache WHERE expires_at <= ?",
                 ),
                 ("admin_sessions", "DELETE FROM admin_sessions WHERE expires_at <= ?"),
             ):
@@ -315,28 +598,62 @@ class Database:
             "relationships": "SELECT COUNT(*) AS n FROM relationships",
             "bot_preferences": "SELECT COUNT(*) AS n FROM bot_preferences",
             "channel_summaries": "SELECT COUNT(*) AS n FROM channel_summaries",
+            "user_profiles": "SELECT COUNT(*) AS n FROM user_profiles",
+            "manual_memories": "SELECT COUNT(*) AS n FROM manual_memories",
+            "discord_admins": "SELECT COUNT(*) AS n FROM discord_admins WHERE enabled = 1",
+            "open_loops": "SELECT COUNT(*) AS n FROM open_loops WHERE status = 'open'",
         }
         for name, sql in queries.items():
             counts[name] = int(await self.scalar(sql) or 0)
         return counts
 
-    async def purge_user(self, guild_id: str, user_id: str) -> None:
-        """Delete all user-owned data in one guild as a single transaction."""
+    async def purge_user(self, user_id: str) -> None:
+        """Delete all data owned by one Discord user across every privacy scope."""
         async with self.connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
-            await connection.execute(
-                "DELETE FROM messages WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            await connection.execute(
-                "DELETE FROM memories WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            await connection.execute(
-                "DELETE FROM relationships WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            await connection.commit()
+            try:
+                await connection.execute(
+                    "DELETE FROM messages WHERE user_id = ?",
+                    (user_id,),
+                )
+                await connection.execute(
+                    "DELETE FROM memories WHERE user_id = ?",
+                    (user_id,),
+                )
+                await connection.execute(
+                    "DELETE FROM relationships WHERE user_id = ?",
+                    (user_id,),
+                )
+                # A compressed channel summary has no per-speaker ownership
+                # map.  Clearing the small cache globally is the only honest
+                # way to guarantee that a forgotten user's words are not left
+                # embedded in one of those summaries.
+                await connection.execute("DELETE FROM channel_summaries")
+                for table, column in (
+                    ("user_profiles", "user_id"),
+                    ("manual_memories", "user_id"),
+                    ("open_loops", "user_id"),
+                    ("summary_sessions", "user_id"),
+                    ("usage_metrics", "user_id"),
+                    ("background_jobs", "user_id"),
+                    ("bot_experiences", "source_user_id"),
+                    ("safety_events", "user_id"),
+                    ("discord_admins", "user_id"),
+                ):
+                    await connection.execute(f"DELETE FROM {table} WHERE {column} = ?", (user_id,))
+                await connection.execute(
+                    "DELETE FROM feedback_events WHERE user_id = ? OR origin_user_id = ?",
+                    (user_id, user_id),
+                )
+                await connection.execute(
+                    """DELETE FROM audit_log
+                       WHERE actor = ? OR target = ? OR details_json LIKE ?""",
+                    (f"discord:{user_id}", user_id, f"%{user_id}%"),
+                )
+                await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
 
     @staticmethod
     def expiry_after(days: int | float | None) -> str | None:

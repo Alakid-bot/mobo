@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -14,11 +16,120 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.auth import SESSION_COOKIE, AdminSession
 from app.database import iso_now
+from app.llm import LLMConfigurationError, LLMProviderError
+from app.model_activation import (
+    MODEL_MANAGED_SETTINGS,
+    ModelActivationError,
+)
 from app.runtime import SECTIONS, SETTING_FIELDS
+from app.safety import DEFAULT_REPLACEMENT
 from app.state import ApplicationState
 
 log = logging.getLogger("mobo.web")
 ROOT = Path(__file__).resolve().parent
+
+_DISCORD_ID_RE = re.compile(r"^[0-9]{15,22}$")
+_RULE_DIRECTIONS = {"input", "output", "both"}
+_RULE_MATCH_TYPES = {"contains", "word", "regex"}
+_RULE_ACTIONS = {"block", "redact", "log"}
+
+
+def _validate_discord_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not _DISCORD_ID_RE.fullmatch(text):
+        raise ValueError("Discord 管理员 ID 必须是 15～22 位数字")
+    return text
+
+
+def _rule_value(
+    payload: dict[str, Any],
+    existing: dict[str, Any] | None,
+    key: str,
+    *,
+    default: Any = "",
+) -> Any:
+    if key in payload and payload[key] is not None:
+        return payload[key]
+    if existing and key in existing:
+        return existing[key]
+    return default
+
+
+def _validate_safety_rule(
+    payload: dict[str, Any], existing: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Normalize a web rule while keeping user-facing errors in Chinese."""
+    name = str(_rule_value(payload, existing, "name", default="")).strip()
+    if not name:
+        raise ValueError("规则名称不能为空")
+    if len(name) > 120:
+        raise ValueError("规则名称不能超过 120 个字符")
+
+    category = str(_rule_value(payload, existing, "category", default="custom")).strip()
+    if not category:
+        category = "custom"
+    if len(category) > 80:
+        raise ValueError("规则分类不能超过 80 个字符")
+
+    direction = str(_rule_value(payload, existing, "direction", default="both")).strip().lower()
+    if direction not in _RULE_DIRECTIONS:
+        raise ValueError("规则方向只能是输入、输出或双向")
+
+    pattern = str(_rule_value(payload, existing, "pattern", default="")).strip()
+    if not pattern:
+        raise ValueError("匹配内容不能为空")
+    if len(pattern) > 4000:
+        raise ValueError("匹配内容不能超过 4000 个字符")
+
+    match_type = (
+        str(_rule_value(payload, existing, "match_type", default="contains")).strip().lower()
+    )
+    if match_type not in _RULE_MATCH_TYPES:
+        raise ValueError("匹配方式只能是包含、完整词或正则表达式")
+    if match_type == "regex":
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError("正则表达式格式无效") from exc
+
+    action = str(_rule_value(payload, existing, "action", default="block")).strip().lower()
+    if action not in _RULE_ACTIONS:
+        raise ValueError("处理方式只能是拦截、替换或记录")
+
+    replacement = str(
+        _rule_value(payload, existing, "replacement", default=DEFAULT_REPLACEMENT)
+    ).strip()
+    if not replacement:
+        replacement = DEFAULT_REPLACEMENT
+    if len(replacement) > 200:
+        raise ValueError("替换文本不能超过 200 个字符")
+
+    raw_priority = _rule_value(payload, existing, "priority", default=100)
+    try:
+        if isinstance(raw_priority, bool):
+            raise ValueError
+        priority = int(raw_priority)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("优先级必须是整数") from exc
+    if not -1_000_000 <= priority <= 1_000_000:
+        raise ValueError("优先级必须在 -1000000 到 1000000 之间")
+
+    enabled = _rule_value(payload, existing, "enabled", default=True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"1", "true", "yes", "on", "是", "开启"}
+    else:
+        enabled = bool(enabled)
+    return {
+        "name": name,
+        "category": category,
+        "direction": direction,
+        "pattern": pattern,
+        "match_type": match_type,
+        "action": action,
+        "replacement": replacement,
+        "enabled": enabled,
+        "priority": priority,
+    }
 
 
 def client_ip(request: Request) -> str:
@@ -74,6 +185,12 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         submitted = request.headers.get("x-csrf-token")
         if not state.auth.verify_csrf(session, submitted):
             return JSONResponse({"ok": False, "error": "安全令牌无效，请刷新页面"}, status_code=403)
+        return session
+
+    async def require_api_read_session(request: Request) -> AdminSession | JSONResponse:
+        session = await session_for(request)
+        if not session:
+            return JSONResponse({"ok": False, "error": "登录已过期"}, status_code=401)
         return session
 
     async def common_context(
@@ -200,6 +317,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         for field in SETTING_FIELDS:
             grouped[field.section].append(field)
         context["sections"] = [(section, grouped[section]) for section in SECTIONS]
+        context["model_managed_settings"] = MODEL_MANAGED_SETTINGS
         return templates.TemplateResponse(request=request, name="settings.html", context=context)
 
     @app.post("/api/settings")
@@ -208,12 +326,28 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         if isinstance(required, JSONResponse):
             return required
         payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=400)
+        raw_values = payload.get("values") or {}
+        raw_clear_secrets = payload.get("clear_secrets") or []
+        if not isinstance(raw_values, dict) or not isinstance(
+            raw_clear_secrets, (list, tuple, set)
+        ):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=400)
+        blocked = MODEL_MANAGED_SETTINGS.intersection(raw_values) | (
+            MODEL_MANAGED_SETTINGS.intersection(raw_clear_secrets)
+        )
+        if blocked:
+            return JSONResponse(
+                {"ok": False, "error": "模型提供方和模型 ID 只能在模型中心通过真实测试后修改"},
+                status_code=400,
+            )
         try:
             values = await state.runtime.update(
-                dict(payload.get("values") or {}),
+                raw_values,
                 actor=required.username,
                 ip_address=client_ip(request),
-                clear_secrets=set(payload.get("clear_secrets") or []),
+                clear_secrets=set(raw_clear_secrets),
             )
             if state.discord_bot and state.discord_bot.is_ready():
                 await state.discord_bot.refresh_presence()
@@ -224,6 +358,419 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return {"ok": True, "values": display}
         except (ValueError, TypeError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+
+    def public_model_error(exc: BaseException, *, operation: str) -> str:
+        """Keep provider/transport details and credentials out of API responses."""
+        if isinstance(exc, ModelActivationError):
+            return str(exc)
+        if isinstance(exc, TimeoutError):
+            return "模型测试超时，请检查网络和连接配置"
+        return f"{operation}失败，请检查提供方、模型 ID 和连接配置"
+
+    @app.get("/models", response_class=HTMLResponse)
+    async def models_page(request: Request):
+        required = await require_html_session(request)
+        if isinstance(required, RedirectResponse):
+            return required
+        context = await common_context(request, required, page="models")
+        context["usage_7d"] = await state.usage.totals(7)
+        context["usage_30d"] = await state.usage.totals(30)
+        context["usage_rows"] = await state.usage.aggregate(30)
+        return templates.TemplateResponse(request=request, name="models.html", context=context)
+
+    @app.post("/api/models/discover")
+    async def discover_models(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            candidate = await state.model_activation.candidate(
+                provider=payload.get("provider"),
+                role=payload.get("role"),
+                model=payload.get("model"),
+            )
+            models = await state.llm.list_models(
+                candidate.config, force=bool(payload.get("force", True))
+            )
+        except (
+            ValueError,
+            TypeError,
+            TimeoutError,
+            LLMConfigurationError,
+            LLMProviderError,
+        ) as exc:
+            return JSONResponse(
+                {"ok": False, "error": public_model_error(exc, operation="模型列表获取")},
+                status_code=422,
+            )
+        except Exception as exc:
+            log.warning("model discovery failed: %s", type(exc).__name__)
+            return JSONResponse(
+                {"ok": False, "error": "模型列表获取失败，请检查提供方、模型 ID 和连接配置"},
+                status_code=422,
+            )
+        await state.database.audit(
+            required.username,
+            "model.discover",
+            target=candidate.config["llm_provider"],
+            details={"count": len(models)},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "models": models[:2000], "count": len(models)}
+
+    @app.post("/api/models/test")
+    async def test_configured_model(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            candidate = await state.model_activation.candidate(
+                provider=payload.get("provider"),
+                role=payload.get("role"),
+                model=payload.get("model"),
+            )
+            result = await state.llm.test_model(candidate.config, role=candidate.role)
+        except (
+            ValueError,
+            TypeError,
+            TimeoutError,
+            LLMConfigurationError,
+            LLMProviderError,
+        ) as exc:
+            await state.usage.record("model_test", status="error", error_code=type(exc).__name__)
+            return JSONResponse(
+                {"ok": False, "error": public_model_error(exc, operation="模型测试")},
+                status_code=422,
+            )
+        except Exception as exc:
+            await state.usage.record("model_test", status="error", error_code=type(exc).__name__)
+            log.warning("model test failed: %s", type(exc).__name__)
+            return JSONResponse(
+                {"ok": False, "error": "模型测试失败，请检查提供方、模型 ID 和连接配置"},
+                status_code=422,
+            )
+        await state.usage.record(
+            "model_test",
+            provider=result.provider,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=round(result.latency_ms),
+        )
+        await state.database.audit(
+            required.username,
+            "model.test",
+            target=f"{result.provider}:{result.model}",
+            details={"role": candidate.role, "latency_ms": round(result.latency_ms)},
+            ip_address=client_ip(request),
+        )
+        return {
+            "ok": True,
+            "provider": result.provider,
+            "model": result.model,
+            "latency_ms": round(result.latency_ms),
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+        }
+
+    @app.post("/api/models/activate")
+    async def activate_model(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            activation = await state.model_activation.activate(
+                provider=payload.get("provider"),
+                role=payload.get("role"),
+                model=payload.get("model"),
+                actor=required.username,
+                ip_address=client_ip(request),
+            )
+            result = activation.result
+            role = activation.role
+        except (
+            ValueError,
+            TypeError,
+            TimeoutError,
+            LLMConfigurationError,
+            LLMProviderError,
+        ) as exc:
+            await state.usage.record(
+                "model_activation_test", status="error", error_code=type(exc).__name__
+            )
+            return JSONResponse(
+                {"ok": False, "error": public_model_error(exc, operation="模型测试")},
+                status_code=422,
+            )
+        except Exception as exc:
+            await state.usage.record(
+                "model_activation_test", status="error", error_code=type(exc).__name__
+            )
+            log.warning("model activation failed: %s", type(exc).__name__)
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "模型测试失败，模型未启用，请检查提供方、模型 ID 和连接配置",
+                },
+                status_code=422,
+            )
+        await state.usage.record(
+            "model_activation_test",
+            provider=result.provider,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=round(result.latency_ms),
+        )
+        await state.database.audit(
+            required.username,
+            "model.activate",
+            target=f"{result.provider}:{result.model}",
+            details={"role": role},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "provider": result.provider, "model": result.model, "role": role}
+
+    @app.get("/api/discord-admins")
+    async def list_discord_admins(request: Request):
+        required = await require_api_read_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        return {"ok": True, "admins": await state.discord_admins.list()}
+
+    @app.post("/api/discord-admins")
+    async def upsert_discord_admin(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            user_id = _validate_discord_id(payload.get("user_id"))
+            note = str(payload.get("note") or "").strip()[:160]
+            normalized = await state.discord_admins.upsert(user_id, note, actor=required.username)
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        await state.database.audit(
+            required.username,
+            "discord_admin.upsert",
+            target=normalized,
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "user_id": normalized}
+
+    @app.post("/api/discord-admins/{user_id}/enabled")
+    async def set_discord_admin_enabled(user_id: str, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            normalized = _validate_discord_id(user_id)
+            value = payload.get("enabled", False)
+            if isinstance(value, str):
+                enabled = value.strip().lower() in {"1", "true", "yes", "on", "是", "开启"}
+            else:
+                enabled = bool(value)
+            changed = await state.discord_admins.set_enabled(
+                normalized, enabled, actor=required.username
+            )
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        await state.database.audit(
+            required.username,
+            "discord_admin.enabled",
+            target=normalized,
+            details={"enabled": enabled},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "changed": changed, "enabled": enabled}
+
+    @app.delete("/api/discord-admins/{user_id}")
+    async def delete_discord_admin(user_id: str, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        try:
+            normalized = _validate_discord_id(user_id)
+            changed = await state.discord_admins.delete(normalized)
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        await state.database.audit(
+            required.username,
+            "discord_admin.delete",
+            target=normalized,
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "changed": changed}
+
+    @app.get("/api/safety-rules")
+    async def list_safety_rules(request: Request):
+        required = await require_api_read_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        rows = await state.database.fetchall(
+            """SELECT id, name, category, direction, pattern, match_type, action,
+                      replacement, enabled, priority, created_at, updated_at
+                 FROM safety_rules ORDER BY priority ASC, id ASC"""
+        )
+        return {"ok": True, "rules": rows}
+
+    @app.post("/api/safety-rules")
+    async def create_safety_rule(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            rule = _validate_safety_rule(dict(payload or {}))
+            rule_id = await state.database.execute(
+                """INSERT INTO safety_rules
+                   (name, category, direction, pattern, match_type, action,
+                    replacement, enabled, priority, created_at, updated_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    rule["name"],
+                    rule["category"],
+                    rule["direction"],
+                    rule["pattern"],
+                    rule["match_type"],
+                    rule["action"],
+                    rule["replacement"],
+                    int(rule["enabled"]),
+                    rule["priority"],
+                    iso_now(),
+                    iso_now(),
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        except sqlite3.IntegrityError:
+            return JSONResponse({"ok": False, "error": "规则内容不符合数据库约束"}, status_code=422)
+        await state.database.audit(
+            required.username,
+            "safety_rule.create",
+            target=str(rule_id),
+            details={"name": rule["name"], "action": rule["action"]},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "id": rule_id}
+
+    @app.post("/api/safety-rules/{rule_id}")
+    @app.put("/api/safety-rules/{rule_id}")
+    @app.patch("/api/safety-rules/{rule_id}")
+    async def update_safety_rule(rule_id: int, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        if rule_id <= 0:
+            return JSONResponse({"ok": False, "error": "规则编号无效"}, status_code=422)
+        existing = await state.database.fetchone(
+            """SELECT id, name, category, direction, pattern, match_type, action,
+                      replacement, enabled, priority FROM safety_rules WHERE id = ?""",
+            (rule_id,),
+        )
+        if not existing:
+            return JSONResponse({"ok": False, "error": "安全规则不存在"}, status_code=404)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        try:
+            rule = _validate_safety_rule(dict(payload or {}), existing)
+            changed = await state.database.execute(
+                """UPDATE safety_rules
+                      SET name = ?, category = ?, direction = ?, pattern = ?,
+                          match_type = ?, action = ?, replacement = ?, enabled = ?,
+                          priority = ?, updated_at = ?
+                    WHERE id = ?""",
+                (
+                    rule["name"],
+                    rule["category"],
+                    rule["direction"],
+                    rule["pattern"],
+                    rule["match_type"],
+                    rule["action"],
+                    rule["replacement"],
+                    int(rule["enabled"]),
+                    rule["priority"],
+                    iso_now(),
+                    rule_id,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        except sqlite3.IntegrityError:
+            return JSONResponse({"ok": False, "error": "规则内容不符合数据库约束"}, status_code=422)
+        await state.database.audit(
+            required.username,
+            "safety_rule.update",
+            target=str(rule_id),
+            details={"name": rule["name"], "action": rule["action"]},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "changed": bool(changed)}
+
+    @app.post("/api/safety-rules/{rule_id}/enabled")
+    async def set_safety_rule_enabled(rule_id: int, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        if rule_id <= 0:
+            return JSONResponse({"ok": False, "error": "规则编号无效"}, status_code=422)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        value = payload.get("enabled", False)
+        if isinstance(value, str):
+            enabled = value.strip().lower() in {"1", "true", "yes", "on", "是", "开启"}
+        else:
+            enabled = bool(value)
+        changed = await state.database.execute(
+            "UPDATE safety_rules SET enabled = ?, updated_at = ? WHERE id = ?",
+            (int(enabled), iso_now(), rule_id),
+        )
+        if not changed:
+            return JSONResponse({"ok": False, "error": "安全规则不存在"}, status_code=404)
+        await state.database.audit(
+            required.username,
+            "safety_rule.enabled",
+            target=str(rule_id),
+            details={"enabled": enabled},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "changed": True, "enabled": enabled}
+
+    @app.delete("/api/safety-rules/{rule_id}")
+    async def delete_safety_rule(rule_id: int, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        if rule_id <= 0:
+            return JSONResponse({"ok": False, "error": "规则编号无效"}, status_code=422)
+        changed = await state.database.execute("DELETE FROM safety_rules WHERE id = ?", (rule_id,))
+        if not changed:
+            return JSONResponse({"ok": False, "error": "安全规则不存在"}, status_code=404)
+        await state.database.audit(
+            required.username,
+            "safety_rule.delete",
+            target=str(rule_id),
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "changed": True}
 
     async def discord_channel_snapshot() -> list[dict[str, Any]]:
         configured = {
@@ -260,6 +807,13 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         context["mood"] = await state.mood.current(await state.runtime.all())
         context["guilds"] = await state.database.fetchall(
             "SELECT guild_id, name, system_prompt, updated_at FROM guilds ORDER BY name"
+        )
+        context["experiences"] = await state.database.fetchall(
+            """SELECT e.*, g.name AS guild_name FROM bot_experiences e
+               LEFT JOIN guilds g ON g.guild_id = e.guild_id
+               WHERE e.expires_at IS NULL OR e.expires_at > ?
+               ORDER BY e.locked DESC, e.importance DESC, e.updated_at DESC LIMIT 100""",
+            (iso_now(),),
         )
         return templates.TemplateResponse(request=request, name="behavior.html", context=context)
 
@@ -349,6 +903,67 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         await state.database.audit(required.username, "mood.set", ip_address=client_ip(request))
         return {"ok": True}
 
+    @app.post("/api/experiences")
+    async def create_experience(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        content = str(payload.get("content") or "").strip()
+        guild_id = str(payload.get("guild_id") or "").strip() or None
+        if guild_id and not guild_id.isdigit():
+            return JSONResponse({"ok": False, "error": "服务器 ID 无效"}, status_code=422)
+        if guild_id and not await state.database.fetchone(
+            "SELECT guild_id FROM guilds WHERE guild_id = ?", (guild_id,)
+        ):
+            return JSONResponse({"ok": False, "error": "服务器不存在"}, status_code=404)
+        try:
+            importance = float(payload.get("importance", 0.7))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "重要度必须是数字"}, status_code=422)
+        if not 0 <= importance <= 1:
+            return JSONResponse({"ok": False, "error": "重要度必须在 0 到 1 之间"}, status_code=422)
+        experience_id = await state.experiences.save(
+            guild_id,
+            None,
+            content,
+            public_safe=True,
+            locked=bool(payload.get("locked")),
+            confidence=1.0,
+            importance=importance,
+        )
+        if experience_id is None:
+            return JSONResponse(
+                {"ok": False, "error": "经历为空、包含敏感信息或已达到锁定记录上限"},
+                status_code=422,
+            )
+        await state.database.audit(
+            required.username,
+            "experience.create",
+            target=str(experience_id),
+            details={"guild_id": guild_id, "locked": bool(payload.get("locked"))},
+            ip_address=client_ip(request),
+        )
+        return {"ok": True, "id": experience_id}
+
+    @app.delete("/api/experiences/{experience_id}")
+    async def delete_experience(experience_id: int, request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        changed = await state.experiences.remove(experience_id)
+        if not changed:
+            return JSONResponse({"ok": False, "error": "经历记录不存在"}, status_code=404)
+        await state.database.audit(
+            required.username,
+            "experience.delete",
+            target=str(experience_id),
+            ip_address=client_ip(request),
+        )
+        return {"ok": True}
+
     @app.post("/api/guilds/{guild_id}/persona")
     async def update_guild_persona(guild_id: str, request: Request):
         required = await require_api_session(request)
@@ -409,10 +1024,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         required = await require_api_session(request)
         if isinstance(required, JSONResponse):
             return required
-        changed = await state.database.execute(
-            "UPDATE memories SET status = 'forgotten', updated_at = ? WHERE id = ? AND status = 'active'",
-            (iso_now(), memory_id),
-        )
+        changed = await state.database.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         await state.database.audit(
             required.username,
             "memory.delete",
@@ -449,6 +1061,19 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             """SELECT created_at, expires_at, ip_address, user_agent
                FROM admin_sessions WHERE admin_id = ? ORDER BY created_at DESC""",
             (required.admin_id,),
+        )
+        context["discord_admins"] = await state.discord_admins.list()
+        context["safety_rules"] = await state.database.fetchall(
+            """SELECT id, name, category, direction, pattern, match_type, action,
+                      replacement, enabled, priority, created_at, updated_at
+                 FROM safety_rules ORDER BY priority ASC, id ASC"""
+        )
+        # Safety events intentionally select metadata only.  The source content
+        # and matched spans are never persisted in this page context.
+        context["safety_events"] = await state.database.fetchall(
+            """SELECT id, rule_id, guild_id, channel_id, user_id, direction,
+                      category, action, content_hash, created_at
+                 FROM safety_events ORDER BY id DESC LIMIT 100"""
         )
         context["db_path"] = str(state.database.path)
         return templates.TemplateResponse(request=request, name="security.html", context=context)

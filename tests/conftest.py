@@ -24,4 +24,8 @@ async def state(tmp_path):
         allowed_hosts="testserver,localhost",
         test_mode=True,
     )
-    return await create_state(bootstrap)
+    application_state = await create_state(bootstrap)
+    try:
+        yield application_state
+    finally:
+        await application_state.database.close()

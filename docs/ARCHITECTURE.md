@@ -2,71 +2,102 @@
 
 ## 进程模型
 
-一个 Python 进程同时运行两个异步任务：
+一个 Python 进程同时运行：
 
-- `discord.py` Gateway 客户端，负责事件、中文 Slash Command 和流式回复。
-- FastAPI + Uvicorn，负责私密管理台和 `/healthz`。
+- `discord.py` Gateway 客户端，负责消息事件、中文 Slash Command、动态历史读取和公开回复。
+- FastAPI + Uvicorn，负责私密可视化管理台和 `/healthz`。
+- 低频维护任务，负责过期数据清理。
 
-任一关键任务异常退出时，编排器会关闭另一任务并让容器退出，由 Zeabur 的服务重启策略接管。应用只监听一个 `PORT`。
+应用只监听一个 HTTP `PORT`。Discord Gateway 通过出站连接工作。Discord 登录失败时管理台保持在线并在总览显示故障；Web 服务或进程级错误仍会让容器退出，由 Zeabur 重启。
 
 ## 必须保持的不变量
 
-1. **不是 selfbot**：`DISCORD_TOKEN` 必须来自 Discord Application 的 Bot 页面。
-2. **一个实例**：SQLite Volume 只能由一个应用副本写入。
-3. **服务器隔离**：用户长期记忆和关系的查询条件必须同时包含 `guild_id` 与 `user_id`。
-4. **两层管理员检查**：管理员命令必须同时有 `default_member_permissions(administrator=True)` 和运行时 `has_permissions(administrator=True)`。
-5. **启动密钥不回显**：Discord Token、会话根密钥和配置加密根密钥不能通过管理台 API 返回。
-6. **用户拥有删除权**：`/忘记` 只能改自己的记忆；`/忘记我` 在单事务中删除自己在当前服务器或私信数据范围内的消息、记忆和关系。
-7. **主动发言双开关**：全局和频道两个开关都为真，且通过安静时段、冷却和日上限后，才允许概率决策。
-8. **模型看见的记忆是不可信数据**：上下文必须明确禁止执行记忆中的指令。
+1. **官方 Bot**：`DISCORD_TOKEN` 只能来自 Discord Application 的 Bot 页面，不能使用个人账号 Token。
+2. **一个实例**：SQLite 目录由进程锁保护，同一 Volume 只允许一个应用副本。
+3. **记忆隔离**：自动记忆与关系用 `guild_id + user_id` 隔离；主动关键词和明确纠正的用户边界以 Discord `user_id` 为全局范围。
+4. **管理双重授权**：管理员 Slash Command 由 Discord 默认权限控制可见性，由数据库 Discord ID 白名单控制实际执行；网页管理台仍需强密码。
+5. **公开与私密隔离**：聊天和动态总结在频道公开；个人记忆、隐私、删除、管理命令和管理台数据均私密显示。
+6. **启动密钥不回显**：Discord Token、会话根密钥和配置加密根密钥不能由管理台 API 返回或写入审计。
+7. **删除先于并发写回**：`/忘记我` 先设置用户接入屏障，再取消并等待该用户已接纳的回复与总结任务，最后在单事务中跨全部范围物理删除个人数据。
+8. **主动发言多重门控**：全局与频道开关都为真，并通过监听授权、静默时段、原子冷却/日额度预占和 token 软预算后，才允许概率决策。
+9. **不可信上下文**：频道历史、摘要、用户名、记忆、用户画像和公开经历不能执行指令或覆盖系统安全规则。
+10. **普通回复单次主调用**：意图、安全和保守记忆提取使用本地逻辑，不增加普通聊天模型调用；超长动态总结是唯一允许按配置分段的路径。
 
-## SQLite 关键表
+## 回复数据流
 
-| 表 | 作用 | 关键隔离键 |
+```text
+消息事件
+  → 忽略 Bot/Webhook、消息 ID 去重
+  → 频道/私信授权与直接交互判断
+  → 本地输入安全
+  → 保存有限期上下文（若启用）
+  → 同 guild/channel/user 的 debounce 与 generation version
+  → 公屏仅加载非可逆风格信号；私密范围才按需检索个人记忆
+  → 人格/情绪/关系/频道历史组装
+  → 单次模型调用
+  → generation version 复核
+  → 本地输出安全
+  → 公开发送与 Discord 消息 ID 绑定
+  → 成功后才进行自动记忆、关系、情绪、待关心事项和公开经历更新
+```
+
+新消息会取消同一会话键的旧任务。即使模型 SDK 没有及时响应取消，发送前后的 generation version 检查也阻止旧结果输出。`/忘记我` 还会阻止新接入、递增版本、等待已接纳任务、取消动态总结并清空本地连续对话与短期消息缓冲，避免删除后旧任务复活数据。
+
+## 动态总结
+
+总结请求只有在严格识别到“最近 N 楼/条”或回复起点“从这里到现在”时触发，并要求频道已开启监听。来源直接取 Discord 当前可见历史，过滤 Bot、Webhook、空消息和命令本身。有效消息数、Discord 实际抓取条数、字符量、用户限流、冷却、token 软预算和全局生成并发都有限制。短范围一次调用工具模型；超出直接 token 预算时按顺序分块，在总调用上限内生成分段摘要并合并。结果公开发送但不持久化到 SQLite，避免多人派生内容无法随单个参与者删除。
+
+## SQLite v2 主要表
+
+| 表 | 作用 | 主要范围 |
 |---|---|---|
-| `admins` | Argon2id 管理密码 | `username` |
-| `admin_sessions` | 哈希会话令牌与 CSRF | `admin_id` |
-| `app_settings` | 运行时配置；密钥字段加密 | `key` |
-| `guilds` | 服务器名称和人设覆盖 | `guild_id` |
-| `channel_settings` | 监听与主动开关 | `guild_id, channel_id` |
-| `messages` | 有过期时间的频道上下文 | `guild_id, channel_id` |
-| `channel_summaries` | 不删除原文的压缩上下文 | `guild_id, channel_id` |
-| `memories` | 显式和自动长期记忆 | `guild_id, user_id` |
-| `relationships` | 四维关系状态 | `guild_id, user_id` |
-| `bot_preferences` | 主题、关键词、权重和锁定状态 | `topic` |
-| `mood_state` | 单例临时情绪 | `id = 1` |
-| `proactive_log` | 冷却与每日额度 | `guild_id, channel_id` |
-| `audit_log` | 重要管理与隐私操作 | 时间倒序索引 |
+| `admins` / `admin_sessions` | 管理密码、哈希会话与 CSRF | 管理台 |
+| `discord_admins` | 管理命令 Discord ID 白名单 | 全局 |
+| `app_settings` | 可视化运行配置；密钥字段加密 | 全局 |
+| `guilds` / `channel_settings` | 服务器人设与监听/主动开关 | 服务器/频道 |
+| `messages` / `channel_summaries` | 有限期频道上下文与兼容摘要 | 服务器/频道 |
+| `user_profiles` / `manual_memories` | 明确纠正的画像与一条主动关键词 | 用户全局 |
+| `memories` / `memory_terms` | 自动长期记忆与关键词倒排索引 | 服务器/用户 |
+| `relationships` | 四维关系状态 | 服务器/用户 |
+| `open_loops` | 有期限、可原子领取的待关心事项 | 服务器/用户 |
+| `bot_preferences` / `mood_state` | mobo 主题偏好与临时情绪 | 全局 |
+| `bot_experiences` | 公开安全、数量有界的服务器经历 | 全局或服务器 |
+| `feedback_events` | 表情反馈与来源用户绑定 | 消息/用户 |
+| `safety_rules` / `safety_events` | 本地安全规则与 hash-only 事件 | 全局/频道 |
+| `model_catalog_cache` | 有 TTL 的模型列表缓存 | 提供方配置 |
+| `usage_metrics` | 不含原文的 token、延迟、状态统计 | 类型/用户 |
+| `summary_sessions` / `background_jobs` | v2 兼容预留表；当前动态总结不持久化 | 兼容 |
+| `audit_log` | 管理与隐私操作 | 全局 |
 
-数据库连接启用 WAL、foreign keys、5 秒 busy timeout 和实际查询所需索引。定时任务每六小时清理过期消息、自动记忆和管理会话。
+数据库使用一条长期 `aiosqlite` 连接、异步写锁、WAL、foreign keys、busy timeout、索引和事务。`PRAGMA user_version` 驱动版本迁移；发现待执行迁移时，先用 SQLite backup API 在数据库同目录生成 `pre-vN` 备份。
 
-## 提示词组装顺序
+## 上下文与 token 策略
 
-1. 全局核心人设或服务器覆盖。
-2. 当前用户的关系描述。
-3. 会衰减的临时情绪。
-4. 当前主题偏好。
-5. 当前服务器内该用户的长期记忆，置于不可信数据边界中。
-6. 频道较早摘要。
-7. 近期频道消息。
-8. 当前用户输入。
+提示词按以下顺序组装：
 
-关系和情绪只改变语气与主动性，不允许覆盖核心安全边界。
+1. 本地安全规范和核心人格或服务器覆盖。
+2. 当前关系、会衰减的情绪、少量主题偏好和当前意图提示。
+3. 公屏只加入白名单化的回复长短与反馈聚合；私信等私密范围才加入一条主动关键词、明确纠正画像和最相关的少量自动记忆。
+4. 最多三条公开经历。
+5. 较早频道摘要（若存在）与有限条近期消息。
+6. 当前输入。
+
+记忆通过标准化关键词、相关度、重要度、置信度、近期性和强化次数加权检索，默认只取 4 条。没有每次对话全库扫描、embedding 请求或二次自审模型调用。
 
 ## 配置模型
 
-`app/config.py` 只读取管理台启动前必须存在的环境变量。`app/runtime.py` 是所有运行时配置的唯一 schema；管理台表单从同一 schema 自动生成，因此新增字段时不会出现“后端有配置但网页漏掉”的第二份清单。
+`app/config.py` 只读取管理台启动前必须存在的环境变量。`app/runtime.py` 是运行时配置的唯一 schema，普通字段由管理台自动渲染；Discord 管理员、安全规则、频道、偏好、经历和模型目录使用专门可视化面板。
 
-运行时密钥用 `CONFIG_ENCRYPTION_KEY` 加密。管理员会话令牌是高熵随机值，数据库只保存用 `SESSION_SECRET` 做 HMAC-SHA256 后的摘要。
+运行时 API Key 用 `CONFIG_ENCRYPTION_KEY` 加密。管理员会话令牌是随机高熵值，数据库只保存以 `SESSION_SECRET` 做 HMAC-SHA256 后的摘要。所有写接口要求登录与 CSRF，重要操作进入审计日志。
 
 ## 扩容路径
 
-需要多副本时不能直接扩大副本数。至少要同时完成：
+需要多副本时不能直接扩大 Zeabur 副本数。至少要同时完成：
 
 1. SQLite 迁移到 PostgreSQL。
-2. 管理会话、限流、主动发言冷却改为共享存储。
+2. 管理会话、限流、模型目录缓存和主动发言冷却改为共享存储。
 3. Discord Gateway shard 或 leader ownership。
-4. 摘要与清理任务加入分布式锁。
-5. 数据迁移校验与回滚演练。
+4. 清理、总结和待关心任务加入分布式锁与幂等键。
+5. 数据迁移、备份恢复和回滚演练。
 
-在这些工作完成前，单实例是功能正确性的组成部分，不只是部署建议。
+在这些工作完成前，单实例是功能正确性的组成部分。

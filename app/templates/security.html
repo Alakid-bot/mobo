@@ -2,10 +2,31 @@
 {% block title %}安全 · mobo 管理台{% endblock %}
 {% block crumb %}安全{% endblock %}
 {% block content %}
-<section class="page-heading"><div><p class="eyebrow">SECURITY BOUNDARY</p><h1>启动密钥和管理凭据</h1><p>这里可以更换管理员密码。Discord Token、会话密钥与加密根密钥只从 Zeabur 环境读取，不允许通过网页回显。</p></div></section>
+<section class="page-heading"><div><p class="eyebrow">安全边界</p><h1>管理员、规则与登录安全</h1><p>管理员 ID 和安全规则都只对已登录的管理者开放。Discord Token、会话密钥与加密根密钥不会在网页中回显。</p></div></section>
+
+<section class="panel" id="discord-admins">
+  <div class="panel-head"><div><p class="eyebrow">DISCORD 权限</p><h2>Discord 管理员 ID</h2></div><span>{{ discord_admins|length }} 个记录</span></div>
+  <p class="panel-intro">只有列在这里且处于启用状态的 Discord 用户，才能使用管理员功能。ID 必须是 15～22 位数字；备注只用于帮助你识别人员。</p>
+  <form id="discord-admin-form" class="inline-editor">
+    <label>Discord 管理员 ID<input name="user_id" inputmode="numeric" pattern="[0-9]{15,22}" maxlength="22" minlength="15" placeholder="例如 123456789012345" required></label>
+    <label>备注（可选）<input name="note" maxlength="160" placeholder="例如：值班同事"></label>
+    <button class="primary-button" type="submit">添加或更新</button>
+  </form>
+  <div class="preference-list editable" id="discord-admin-list">
+    {% for item in discord_admins %}
+    <div data-discord-admin-id="{{ item.user_id }}">
+      <span><strong>{{ item.user_id }}</strong><small>{{ item.note or '没有备注' }}</small></span>
+      <b class="admin-enabled-label">{{ '启用' if item.enabled else '停用' }}</b>
+      <button type="button" data-toggle-discord-admin data-enabled="{{ 'true' if item.enabled else 'false' }}">{{ '停用' if item.enabled else '启用' }}</button>
+      <button type="button" data-delete-discord-admin aria-label="删除 {{ item.user_id }}">删除</button>
+    </div>
+    {% else %}<p class="empty">还没有 Discord 管理员 ID。添加后才能通过 Discord 进行管理操作。</p>{% endfor %}
+  </div>
+</section>
+
 <div class="two-column align-start">
   <section class="panel">
-    <div class="panel-head"><div><p class="eyebrow">PASSWORD</p><h2>更换管理员密码</h2></div><span class="status-chip on">Argon2id</span></div>
+    <div class="panel-head"><div><p class="eyebrow">登录凭据</p><h2>更换管理员密码</h2></div><span class="status-chip on">已保护</span></div>
     <form id="password-form" class="stack-form">
       <label>当前密码<input name="current_password" type="password" autocomplete="current-password" required></label>
       <label>新密码<input name="new_password" type="password" autocomplete="new-password" minlength="16" required></label>
@@ -14,12 +35,50 @@
     </form>
   </section>
   <section class="panel">
-    <div class="panel-head"><div><p class="eyebrow">BOOTSTRAP</p><h2>只读启动配置</h2></div></div>
+    <div class="panel-head"><div><p class="eyebrow">启动安全</p><h2>只读启动配置</h2></div></div>
     <dl class="security-list"><div><dt>Discord Token</dt><dd>{{ '已设置' if bootstrap.discord_token else '缺失' }}</dd></div><div><dt>会话密钥</dt><dd>{{ '已设置' if bootstrap.session_secret else '缺失' }}</dd></div><div><dt>配置加密密钥</dt><dd>{{ '已设置' if bootstrap.config_encryption_key else '缺失' }}</dd></div><div><dt>SQLite 路径</dt><dd><code>{{ db_path }}</code></dd></div><div><dt>安全 Cookie</dt><dd>{{ '开启' if bootstrap.cookie_secure else '关闭（仅本地）' }}</dd></div></dl>
   </section>
 </div>
+
+<section class="panel" id="safety-rules">
+  <div class="panel-head"><div><p class="eyebrow">内容安全</p><h2>安全规则</h2></div><span>{{ safety_rules|length }} 条规则</span></div>
+  <p class="panel-intro">规则按优先级从小到大执行。可以检查输入、输出或双向内容，并选择拦截、替换或仅记录。配置页中的策略提示词和词库仍由“全部配置”统一管理。</p>
+  <form id="safety-rule-form" class="settings-form">
+    <input type="hidden" name="id">
+    <div class="field-grid">
+      <label class="config-field"><span class="field-title">规则名称</span><input name="name" maxlength="120" required placeholder="例如：隐藏手机号"></label>
+      <label class="config-field"><span class="field-title">分类</span><input name="category" maxlength="80" value="custom" placeholder="例如：隐私"></label>
+      <label class="config-field"><span class="field-title">检查方向</span><select name="direction"><option value="input">输入内容</option><option value="output">输出内容</option><option value="both" selected>输入和输出</option></select></label>
+      <label class="config-field"><span class="field-title">匹配方式</span><select name="match_type"><option value="contains" selected>包含文字</option><option value="word">完整词</option><option value="regex">正则表达式</option></select></label>
+      <label class="config-field wide"><span class="field-title">匹配内容</span><textarea name="pattern" rows="3" maxlength="4000" required placeholder="输入要识别的文字或正则表达式"></textarea><small>匹配内容仅用于规则执行；安全事件不会保存或显示命中文本。</small></label>
+      <label class="config-field"><span class="field-title">处理方式</span><select name="action"><option value="block" selected>拦截</option><option value="redact">替换后继续</option><option value="log">只记录</option></select></label>
+      <label class="config-field"><span class="field-title">替换文本</span><input name="replacement" maxlength="200" value="[已隐藏]" placeholder="仅替换规则使用"></label>
+      <label class="config-field"><span class="field-title">优先级</span><input name="priority" type="number" min="-1000000" max="1000000" step="1" value="100"></label>
+      <label class="config-field toggle-field"><span class="field-title">是否启用</span><span class="switch"><input name="enabled" type="checkbox" checked><i></i><b>已开启</b></span></label>
+    </div>
+    <div class="save-dock"><span data-safety-form-state>新增规则</span><span><button class="text-button" type="button" data-reset-safety-rule>清空表单</button><button class="primary-button" type="submit">保存规则</button></span></div>
+  </form>
+  <div class="preference-list editable" id="safety-rule-list">
+    {% for item in safety_rules %}
+    <div data-safety-rule-id="{{ item.id }}" data-rule-name="{{ item.name }}" data-rule-category="{{ item.category }}" data-rule-direction="{{ item.direction }}" data-rule-pattern="{{ item.pattern }}" data-rule-match-type="{{ item.match_type }}" data-rule-action="{{ item.action }}" data-rule-replacement="{{ item.replacement }}" data-rule-priority="{{ item.priority }}" data-rule-enabled="{{ 'true' if item.enabled else 'false' }}">
+      <span><strong>{{ item.name }}</strong><small>{{ item.category }} · {{ {'input': '输入', 'output': '输出', 'both': '双向'}.get(item.direction, item.direction) }} · {{ item.pattern }}</small></span>
+      <b>{{ '启用' if item.enabled else '停用' }}</b>
+      <button type="button" data-edit-safety-rule>编辑</button>
+      <button type="button" data-toggle-safety-rule data-enabled="{{ 'true' if item.enabled else 'false' }}">{{ '停用' if item.enabled else '启用' }}</button>
+      <button type="button" data-delete-safety-rule aria-label="删除 {{ item.name }}">删除</button>
+    </div>
+    {% else %}<p class="empty">还没有自定义安全规则。你可以先添加一条包含文字、完整词或正则表达式的规则。</p>{% endfor %}
+  </div>
+</section>
+
 <section class="panel">
-  <div class="panel-head"><div><p class="eyebrow">ACTIVE SESSIONS</p><h2>当前管理会话</h2></div><span>{{ sessions|length }} 个</span></div>
+  <div class="panel-head"><div><p class="eyebrow">当前会话</p><h2>当前管理会话</h2></div><span>{{ sessions|length }} 个</span></div>
   <div class="data-table session-table"><div class="data-row header"><span>创建时间</span><span>到期时间</span><span>IP</span><span>浏览器</span></div>{% for item in sessions %}<div class="data-row"><time>{{ item.created_at[:19].replace('T', ' ') }}</time><time>{{ item.expires_at[:19].replace('T', ' ') }}</time><span>{{ item.ip_address }}</span><span class="truncate">{{ item.user_agent }}</span></div>{% endfor %}</div>
+</section>
+
+<section class="panel" id="safety-events">
+  <div class="panel-head"><div><p class="eyebrow">安全事件</p><h2>最近触发记录</h2></div><span>只显示摘要</span></div>
+  <p class="panel-intro">为保护用户隐私，这里只显示时间、方向、规则编号、分类、处理结果、范围元数据和内容哈希，不显示原始消息或命中的文字。</p>
+  <div class="data-table audit-table"><div class="data-row header"><span>时间</span><span>方向 / 处理</span><span>规则 / 分类</span><span>内容哈希与范围</span></div>{% for item in safety_events %}<div class="data-row"><time>{{ item.created_at[:19].replace('T', ' ') }}</time><span>{{ {'input': '输入', 'output': '输出'}.get(item.direction, item.direction) }} · {{ {'block': '拦截', 'redact': '替换', 'log': '记录'}.get(item.action, item.action) }}</span><span>规则 #{{ item.rule_id or '内置' }} · {{ item.category }}</span><span><code>{{ item.content_hash }}</code><small>服务器 {{ item.guild_id or '未知' }} · 频道 {{ item.channel_id or '未知' }} · 用户 {{ item.user_id or '未知' }}</small></span></div>{% else %}<p class="empty">还没有安全事件。</p>{% endfor %}</div>
 </section>
 {% endblock %}

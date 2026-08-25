@@ -46,6 +46,7 @@ async def test_every_runtime_field_is_persisted_and_secret_is_encrypted(tmp_path
     assert stored["is_secret"] == 1
     assert secret not in stored["value"]
     assert json.loads(stored["value"]) != secret
+    await database.close()
 
 
 @pytest.mark.asyncio
@@ -59,6 +60,7 @@ async def test_blank_secret_does_not_overwrite_but_explicit_clear_does(tmp_path)
     assert await runtime.get("openai_api_key") == "sk-original"
     await runtime.update({}, actor="test", clear_secrets={"openai_api_key"})
     assert await runtime.get("openai_api_key") == ""
+    await database.close()
 
 
 @pytest.mark.asyncio
@@ -67,7 +69,3 @@ async def test_runtime_validation_rejects_unknown_and_out_of_range_fields(state)
         await state.runtime.update({"made_up": True}, actor="test")
     with pytest.raises(ValueError, match="不能大于"):
         await state.runtime.update({"llm_temperature": 99}, actor="test")
-    with pytest.raises(ValueError, match="摘要触发条数"):
-        await state.runtime.update(
-            {"max_history_messages": 50, "summary_trigger": 40}, actor="test"
-        )

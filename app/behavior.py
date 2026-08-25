@@ -116,6 +116,56 @@ class ProactiveService:
             return start <= current < end
         return current >= start or current < end
 
+    async def _reserve_channel_slot(
+        self,
+        guild_id: str,
+        channel_id: str,
+        reason: str,
+        *,
+        now_utc: datetime,
+        utc_start: str,
+        cooldown_minutes: int,
+        daily_limit: int,
+    ) -> str | None:
+        """Atomically check and consume a channel slot before model generation."""
+
+        async with self.database.connect() as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await connection.execute(
+                    """SELECT created_at FROM proactive_log
+                       WHERE guild_id = ? AND channel_id = ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (guild_id, channel_id),
+                )
+                last_row = await cursor.fetchone()
+                if last_row is not None:
+                    elapsed = (
+                        now_utc - datetime.fromisoformat(str(last_row["created_at"]))
+                    ).total_seconds() / 60
+                    if elapsed < cooldown_minutes:
+                        await connection.rollback()
+                        return "频道冷却中"
+                cursor = await connection.execute(
+                    """SELECT COUNT(*) AS n FROM proactive_log
+                       WHERE guild_id = ? AND channel_id = ? AND created_at >= ?""",
+                    (guild_id, channel_id, utc_start),
+                )
+                count_row = await cursor.fetchone()
+                if int(count_row["n"]) >= daily_limit:
+                    await connection.rollback()
+                    return "今日额度已用完"
+                await connection.execute(
+                    """INSERT INTO proactive_log(guild_id, channel_id, reason, created_at)
+                       VALUES(?, ?, ?, ?)""",
+                    (guild_id, channel_id, reason, now_utc.isoformat()),
+                )
+                await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
+        return None
+
     async def decide(
         self,
         guild_id: str,
@@ -135,6 +185,10 @@ class ProactiveService:
             return ProactiveDecision(False, "消息太短")
         now_utc = now or utcnow()
         now_local = self._local_now(config, now_utc)
+        local_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_start = local_start.astimezone(UTC).isoformat()
+        if await self.soft_budget_reached(config, now=now_utc):
+            return ProactiveDecision(False, "今日 Token 软预算已达上限")
         if self._in_quiet_hours(
             now_local,
             str(config["proactive_quiet_start"]),
@@ -151,8 +205,6 @@ class ProactiveService:
             elapsed = (now_utc - datetime.fromisoformat(last)).total_seconds() / 60
             if elapsed < int(config["proactive_cooldown_minutes"]):
                 return ProactiveDecision(False, "频道冷却中")
-        local_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        utc_start = local_start.astimezone(UTC).isoformat()
         count = int(
             await self.database.scalar(
                 """SELECT COUNT(*) AS n FROM proactive_log
@@ -163,21 +215,65 @@ class ProactiveService:
         )
         if count >= int(config["proactive_daily_limit"]):
             return ProactiveDecision(False, "今日额度已用完")
-        interest, topics = await self.preferences.interest_for(content)
-        relationship = await self.relationships.get(
-            guild_id, user_id, int(config["relationship_decay_days"])
+        # Deciding whether to speak is observation, not feedback.  Learning here
+        # would make mobo's preferences drift even when it ultimately stays quiet.
+        interest, topics = await self.preferences.interest_for(content, learn=False)
+        if config["relationship_enabled"]:
+            relationship = await self.relationships.get(
+                guild_id, user_id, int(config["relationship_decay_days"])
+            )
+            familiarity = relationship.familiarity
+            fatigue = relationship.fatigue
+        else:
+            familiarity = 0.0
+            fatigue = 0.0
+        social_budget = (
+            float((await self.mood.current(config))["social_budget"])
+            if config["mood_enabled"]
+            else float(config["mood_baseline_social_budget"])
         )
-        current_mood = await self.mood.current(config)
         probability = float(config["proactive_base_probability"])
         probability *= max(0.1, 0.7 + interest)
-        probability *= 0.75 + relationship.familiarity * 0.5
-        probability *= 0.5 + float(current_mood["social_budget"])
-        probability *= 1.0 - relationship.fatigue * 0.7
+        probability *= 0.75 + familiarity * 0.5
+        probability *= 0.5 + social_budget
+        probability *= 1.0 - fatigue * 0.7
         probability = clamp(probability, 0.0, 0.5)
         if self.random_value() >= probability:
             return ProactiveDecision(False, "本次保持安静", probability)
         reason = "偏好话题：" + "、".join(topics) if topics else "自然参与"
+        denied = await self._reserve_channel_slot(
+            guild_id,
+            channel_id,
+            reason,
+            now_utc=now_utc,
+            utc_start=utc_start,
+            cooldown_minutes=int(config["proactive_cooldown_minutes"]),
+            daily_limit=int(config["proactive_daily_limit"]),
+        )
+        if denied is not None:
+            return ProactiveDecision(False, denied, probability)
         return ProactiveDecision(True, reason, probability)
+
+    async def soft_budget_reached(
+        self, config: dict[str, Any], *, now: datetime | None = None
+    ) -> bool:
+        """Return whether background/proactive work should pause for the local day."""
+
+        soft_budget = int(config.get("daily_soft_token_budget", 0) or 0)
+        if not soft_budget:
+            return False
+        now_utc = now or utcnow()
+        now_local = self._local_now(config, now_utc)
+        utc_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+        used_tokens = int(
+            await self.database.scalar(
+                """SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS n
+                   FROM usage_metrics WHERE created_at >= ?""",
+                (utc_start.isoformat(),),
+            )
+            or 0
+        )
+        return used_tokens >= soft_budget
 
     async def record(self, guild_id: str, channel_id: str, reason: str) -> None:
         await self.database.execute(

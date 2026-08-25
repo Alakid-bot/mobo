@@ -49,6 +49,21 @@
   </section>
 </div>
 
+<section class="panel" id="experiences">
+  <div class="panel-head"><div><p class="eyebrow">MOBO MEMORY</p><h2>mobo 的公开经历</h2></div><span>{{ experiences|length }} 条</span></div>
+  <p class="panel-intro">这里只放可以在群聊中自然提起的公开经历，不要填写用户隐私。锁定后不会被自动经历挤掉。</p>
+  <form id="experience-form" class="inline-editor">
+    <label>经历内容<input name="content" required maxlength="300" placeholder="例如：我和大家一起见证了服务器三周年"></label>
+    <label>范围<select name="guild_id"><option value="">所有服务器</option>{% for guild in guilds %}<option value="{{ guild.guild_id }}">{{ guild.name }}</option>{% endfor %}</select></label>
+    <label>重要度<input name="importance" type="number" min="0" max="1" step="0.05" value="0.7"></label>
+    <label class="check-label"><input name="locked" type="checkbox"> 锁定保留</label>
+    <button class="primary-button" type="submit">保存经历</button>
+  </form>
+  <div class="preference-list editable">
+    {% for item in experiences %}<div data-experience-id="{{ item.id }}"><span><strong>{{ item.content }}</strong><small>{{ item.guild_name or '所有服务器' }} · {{ item.evidence_count }} 次印象</small></span><b>{{ '锁定' if item.locked else '可演化' }}</b><em>重要度 {{ '%.2f'|format(item.importance) }}</em><button type="button" data-delete-experience>删除</button></div>{% else %}<p class="empty">还没有公开经历。正常群聊中命中已知偏好主题后，也会保守地形成概括性经历。</p>{% endfor %}
+  </div>
+</section>
+
 <section class="panel">
   <div class="panel-head"><div><p class="eyebrow">SERVER PERSONAS</p><h2>服务器人设覆盖</h2></div><a href="/settings#section-1">编辑全局人设</a></div>
   <div class="guild-personas">
