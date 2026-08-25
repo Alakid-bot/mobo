@@ -165,14 +165,21 @@ class TestBridgeTemplateRendering:
         assert "非法字符" in result
 
     @pytest.mark.asyncio
-    async def test_normal_input_renders_template(self):
-        """正常输入触发 HTTP 调用（网络不可达时返回错误文本）。"""
-        endpoints = [_endpoint(request_template='{"q": "{input}"}')]
+    async def test_normal_input_renders_template(self, monkeypatch):
+        """正常输入渲染模板并解析响应字段（HTTP 桩，无网络）。"""
+        from app import agent as agent_mod
+
+        def fake_http(url, method, body, auth_header, timeout):
+            assert "{input}" not in body  # 占位符已被替换
+            assert "你好世界" in body
+            return '{"data": {"answer": "OK"}}'
+
+        monkeypatch.setattr(agent_mod, "_http_call", fake_http)
+        endpoints = [_endpoint(request_template='{"q": "{input}"}', response_field="data.answer")]
         result = await _bot_bridge_handler(
             "测试端点", "你好世界", bridge_endpoints=endpoints
         )
-        # 错误来自 HTTP 调用而非模板渲染
-        assert "错误" in result or "端点" in result
+        assert result == "OK"
 
     @pytest.mark.asyncio
     async def test_audit_called_even_on_rejection(self):
@@ -342,7 +349,7 @@ class TestAgentLoopTimeout:
         tc = _tool_call_result()
 
         async def slow_handler(name: str, input: str) -> str:
-            await asyncio.sleep(10)
+            await asyncio.sleep(3)
             return "never"
 
         gateway = _StubGateway([tc])
@@ -353,28 +360,120 @@ class TestAgentLoopTimeout:
         )
         assert out is not None
 
+    @pytest.mark.asyncio
+    async def test_handler_bounded_by_deadline(self):
+        """端点配置的超长 timeout 也受循环总预算约束。"""
+        tc = _tool_call_result()
 
-class TestAgentLoopAuditLogging:
-    """每次工具调用写审计日志。"""
+        async def slow_handler(name: str, input: str) -> str:
+            await asyncio.sleep(3)
+            return "never"
+
+        gateway = _StubGateway([tc, _final_result("done")])
+        registry = {"bot_bridge": ("desc", slow_handler)}
+        out = await agent_loop(
+            gateway, _config(), [{"role": "user", "content": "test"}],
+            tool_registry=registry, total_timeout=0.05,
+        )
+        # handler 被 wait_for 取消，循环降级而不是等 3 秒
+        assert out is not None
+
+
+class TestAgentLoopAccounting:
+    """token 汇总与首轮失败语义。"""
 
     @pytest.mark.asyncio
-    async def test_audit_called_on_tool_use(self):
+    async def test_tokens_summed_across_rounds(self):
+        async def stub_handler(name: str, input: str) -> str:
+            return "ok"
+
+        gateway = _StubGateway([_tool_call_result(), _final_result("done")])
+        registry = {"bot_bridge": ("desc", stub_handler)}
+        out = await agent_loop(
+            gateway, _config(), [{"role": "user", "content": "test"}],
+            tool_registry=registry,
+        )
+        assert out.input_tokens == 10 + 15
+        assert out.output_tokens == 5 + 8
+
+    @pytest.mark.asyncio
+    async def test_round1_provider_failure_reraises(self):
+        """首轮模型调用失败直接上抛，走既有错误路径。"""
+
+        class FailingGateway:
+            async def complete(self, config, messages, *, role="chat", tools=None):
+                raise RuntimeError("provider down")
+
+        registry = {"bot_bridge": ("desc", None)}
+        with pytest.raises(RuntimeError, match="provider down"):
+            await agent_loop(
+                FailingGateway(), _config(), [{"role": "user", "content": "test"}],
+                tool_registry=registry,
+            )
+
+
+class TestAgentLoopAuditLogging:
+    """每次工具调用恰好一行审计（handler 级，含真实状态与轮次）。"""
+
+    @pytest.mark.asyncio
+    async def test_handler_audit_written_once_with_round(self):
+        audit_fn = AsyncMock()
+        round_state = {"round": 0}
+        registry = build_tools(
+            [_endpoint()],
+            audit_fn=audit_fn,
+            actor="test:user",
+            round_state=round_state,
+        )
+        # 让真实 HTTP 不可达 → status=error，但审计仍恰好一行
+        gateway = _StubGateway([
+            _tool_call_result(),
+            _final_result("done"),
+        ])
+        round_state["round"] = 1
+
+        await agent_loop(
+            gateway, _config(), [{"role": "user", "content": "test"}],
+            tool_registry=registry, round_state=round_state,
+        )
+        audit_fn.assert_called_once()
+        call_kwargs = audit_fn.call_args.kwargs
+        assert call_kwargs["action"] == "tool_call"
+        assert call_kwargs["actor"] == "test:user"
+        assert call_kwargs["details"]["round"] == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_audited_by_loop(self):
         audit_fn = AsyncMock()
 
         async def stub_handler(name: str, input: str) -> str:
             return "ok"
 
-        gateway = _StubGateway([_tool_call_result(), _final_result("done")])
+        tc = _tool_call_result()
+        # 改名为未注册工具
+        tc = ModelResult(
+            text="", input_tokens=1, output_tokens=1, latency_ms=0,
+            provider="openai", model="chat-model",
+            tool_calls=(
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "not_a_tool",
+                        "arguments": json.dumps({"name": "x", "input": "y"}),
+                    },
+                },
+            ),
+        )
+        gateway = _StubGateway([tc, _final_result("done")])
         registry = {"bot_bridge": ("desc", stub_handler)}
 
         await agent_loop(
             gateway, _config(), [{"role": "user", "content": "test"}],
             tool_registry=registry, audit_fn=audit_fn, actor="test:user",
         )
-        audit_fn.assert_called()
-        call_kwargs = audit_fn.call_args.kwargs
-        assert call_kwargs["action"] == "tool_call"
-        assert call_kwargs["actor"] == "test:user"
+        audit_fn.assert_called_once()
+        assert audit_fn.call_args.kwargs["details"]["status"] == "unknown_tool"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -386,6 +485,11 @@ class TestGuildToolsToggle:
     def test_global_off_disables_all(self):
         config = _config(tools_global=False, guild_tools={"g1": True})
         assert tools_enabled_for_guild(config, "g1") is False
+
+    def test_dm_never_enabled(self):
+        """DM 一律禁用，即使管理员误把它写进开关表。"""
+        config = _config(tools_global=True, guild_tools={"dm:123": True})
+        assert tools_enabled_for_guild(config, "dm:123") is False
 
     def test_guild_not_in_map_disabled(self):
         config = _config(tools_global=True, guild_tools={"g1": True})

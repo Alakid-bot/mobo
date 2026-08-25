@@ -513,6 +513,8 @@ class MoboBot(commands.Bot):
         self._reaction_cooldowns: dict[str, float] = {}   # channel_id → last reaction timestamp
         self._reaction_daily_count: int = 0
         self._reaction_daily_date: date | None = None
+        # 工具桥每用户冷却（内存态，重启清零）
+        self._tool_cooldowns: dict[str, float] = {}
 
     async def setup_hook(self) -> None:
         await self.add_cog(PublicCommands(self))
@@ -1312,14 +1314,24 @@ class MoboBot(commands.Bot):
             self._inject_burst_context(context, payload.burst_context)
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
-            # ── 工具桥：有界 agent 循环（仅当工具启用时） ────────────
+            # ── 工具桥：有界 agent 循环（仅当工具启用且用户冷却已过） ──
             from app.agent import (
                 agent_loop,
                 build_tools,
                 tools_enabled_for_guild,
             )
 
-            if tools_enabled_for_guild(payload.config, payload.guild_id):
+            tools_on = tools_enabled_for_guild(payload.config, payload.guild_id)
+            if tools_on:
+                now_mono = time.monotonic()
+                if now_mono - self._tool_cooldowns.get(payload.user_id, 0.0) < (
+                    self._TOOL_COOLDOWN_SECONDS
+                ):
+                    tools_on = False
+                else:
+                    self._tool_cooldowns[payload.user_id] = now_mono
+
+            if tools_on:
                 try:
                     bridge_raw = payload.config.get("bridge_endpoints", "[]")
                     bridge_endpoints = (
@@ -1329,28 +1341,23 @@ class MoboBot(commands.Bot):
                         bridge_endpoints = []
                 except (json.JSONDecodeError, TypeError):
                     bridge_endpoints = []
+                round_state: dict[str, int] = {"round": 0}
                 tool_registry = build_tools(
                     bridge_endpoints,
                     audit_fn=self.state.database.audit,
                     actor=f"discord:{payload.user_id}",
+                    round_state=round_state,
                 )
                 if tool_registry:
-                    try:
-                        result = await agent_loop(
-                            self.state.llm,
-                            payload.config,
-                            context,
-                            tool_registry=tool_registry,
-                            role=role,
-                            audit_fn=self.state.database.audit,
-                            actor=f"discord:{payload.user_id}",
-                            guild_id=payload.guild_id,
-                        )
-                    except Exception:
-                        log.warning("agent 循环异常，降级为无工具模式", exc_info=True)
-                        result = await self.state.llm.complete(
-                            payload.config, context, role=role
-                        )
+                    # 首轮失败由 agent_loop 上抛，走既有错误路径（友好提示 + usage 记错）
+                    result = await agent_loop(
+                        self.state.llm,
+                        payload.config,
+                        context,
+                        tool_registry=tool_registry,
+                        role=role,
+                        round_state=round_state,
+                    )
                 else:
                     result = await self.state.llm.complete(
                         payload.config, context, role=role
@@ -1962,6 +1969,7 @@ class MoboBot(commands.Bot):
     # ── 轻量反应 ──────────────────────────────────────────────────────
     _REACTION_COOLDOWN_SECONDS = 600.0   # 每频道 10 分钟
     _REACTION_DAILY_CAP = 200
+    _TOOL_COOLDOWN_SECONDS = 30.0        # 每用户工具循环冷却
 
     async def _maybe_react(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -710,11 +711,12 @@ async def test_humanized_reply_sends_fragments_separately(state):
     )
 
     async def complete(_config, messages, *, role):
-        return _model_result("第一句话讲点事情。第二句话再补充一下。")
+        return _model_result("第一句话讲点事情。第二句话再补充一下。第三句话收尾。")
 
     state.llm.complete = AsyncMock(side_effect=complete)
     user = FakeUser(111111111111111)
     message = FakeMessage(130, user, channel, f"<@{bot_user.id}> 说两句", mentions=[bot_user])
+    random.seed(2026)
     await bot.on_message(message)
 
     contents = [s.content for s in channel.sent]
@@ -747,6 +749,92 @@ async def test_humanized_blocked_fragment_collapses_to_refusal(state):
 
     contents = [s.content for s in channel.sent]
     assert contents == [SAFE_REFUSAL]
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_end_to_end(state, monkeypatch):
+    """工具桥端到端：模型发起 tool_calls → bridge 桩 → 审计落库 → 正常回复。"""
+    import json as _json
+
+    from app import agent as agent_mod
+    from app.llm import ModelResult
+
+    bot, bot_user, channel = await _ready_bot(state)
+    await state.runtime.update(
+        {
+            "tools_enabled_global": True,
+            "guild_tools_enabled": '{"333333333333333": true}',
+            "bridge_endpoints": _json.dumps(
+                [
+                    {
+                        "名称": "echo",
+                        "url": "https://bridge.internal/api",
+                        "method": "POST",
+                        "request_template": '{"q": "{input}"}',
+                        "auth_header": "",
+                        "response_field": "answer",
+                        "timeout": 5,
+                    }
+                ]
+            ),
+        },
+        actor="test",
+    )
+
+    http_bodies: list[str] = []
+
+    def fake_http(url, method, body, auth_header, timeout):
+        http_bodies.append(body)
+        return '{"answer": "桥接返回"}'
+
+    monkeypatch.setattr(agent_mod, "_http_call", fake_http)
+
+    results = [
+        ModelResult(
+            text="",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=10.0,
+            provider="openai",
+            model="chat-model",
+            tool_calls=(
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "bot_bridge",
+                        "arguments": _json.dumps({"name": "echo", "input": "问一下桥"}),
+                    },
+                },
+            ),
+        ),
+        ModelResult(
+            text="桥说：桥接返回",
+            input_tokens=15,
+            output_tokens=8,
+            latency_ms=10.0,
+            provider="openai",
+            model="chat-model",
+        ),
+    ]
+
+    async def complete(_config, messages, *, role, tools=None):
+        return results.pop(0)
+
+    state.llm.complete = AsyncMock(side_effect=complete)
+    user = FakeUser(111111111111111)
+    message = FakeMessage(132, user, channel, f"<@{bot_user.id}> 问一下桥", mentions=[bot_user])
+    await bot.on_message(message)
+
+    assert http_bodies == ['{"q": "问一下桥"}']
+    contents = [s.content for s in channel.sent]
+    assert len(contents) == 1
+    assert "桥接返回" in contents[0]
+    audit_rows = await state.database.fetchall(
+        "SELECT details_json FROM audit_log WHERE action = 'tool_call'"
+    )
+    assert len(audit_rows) == 1
+    assert "echo" in audit_rows[0]["details_json"]
 
 
 @pytest.mark.asyncio
