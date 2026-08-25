@@ -1,10 +1,18 @@
 mobo
 Copyright 2026 Alakid-bot
 
-This product is a substantially modified derivative of “1812” by
+This product is a substantially modified derivative of "1812" by
 Aaron K. Clark / CryptoJones, originally published at:
 https://github.com/CryptoJones/1812
+(portions originally under Apache License 2.0; incorporation into this
+GPL-3.0-or-later project is one-way compatible and attribution is retained
+in this NOTICE and the source history).
 
-The original work and this derivative are distributed under the
-Apache License, Version 2.0. Modified files include prominent project-level
-documentation in this NOTICE and the source history.
+Humanization post-processing (typo generation, message fragmentation,
+typing-time pacing), the reply-necessity gate design, and prompt structure
+are derived from "MaiBot" (麦麦) by the Mai-with-u project:
+https://github.com/Mai-with-u/MaiBot
+(GNU General Public License v3).
+
+This project as a whole is distributed under the GNU General Public
+License, Version 3 or later (GPL-3.0-or-later). See [LICENSE](LICENSE).

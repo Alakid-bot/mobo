@@ -2,7 +2,7 @@
 
 一个只使用官方 Discord Bot API 的中文情感陪伴机器人。mobo 会在群聊里自然回应提及和回复，理解近期对话，形成克制而可删除的记忆，并让自己的情绪、关系、偏好和经历缓慢变化。
 
-它不是 selfbot，不使用个人 Discord Token。项目遵循 Apache License 2.0，原始作品归属与修改说明见 [NOTICE](NOTICE)。
+它不是 selfbot，不使用个人 Discord Token。项目遵循 GPL-3.0-or-later，衍生归属与修改说明见 [NOTICE](NOTICE)。
 
 ## mobo 的特点
 
@@ -199,4 +199,4 @@ python -m pytest
 
 ## 许可证
 
-Apache License 2.0。原项目版权与归属保留在 [LICENSE](LICENSE) 和 [NOTICE](NOTICE) 中。
+GPL-3.0-or-later。原项目（1812）与移植来源（MaiBot/麦麦）的版权与归属保留在 [LICENSE](LICENSE) 和 [NOTICE](NOTICE) 中。
