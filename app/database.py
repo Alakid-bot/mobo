@@ -193,15 +193,6 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     interaction_count INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS manual_memories (
-    user_id TEXT PRIMARY KEY,
-    keywords_json TEXT NOT NULL DEFAULT '[]',
-    normalized_text TEXT NOT NULL DEFAULT '',
-    char_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS memory_terms (
     memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     guild_id TEXT NOT NULL,
@@ -619,7 +610,6 @@ class Database:
             "bot_preferences": "SELECT COUNT(*) AS n FROM bot_preferences",
             "channel_summaries": "SELECT COUNT(*) AS n FROM channel_summaries",
             "user_profiles": "SELECT COUNT(*) AS n FROM user_profiles",
-            "manual_memories": "SELECT COUNT(*) AS n FROM manual_memories",
             "discord_admins": "SELECT COUNT(*) AS n FROM discord_admins WHERE enabled = 1",
             "open_loops": "SELECT COUNT(*) AS n FROM open_loops WHERE status = 'open'",
         }
@@ -651,7 +641,6 @@ class Database:
                 await connection.execute("DELETE FROM channel_summaries")
                 for table, column in (
                     ("user_profiles", "user_id"),
-                    ("manual_memories", "user_id"),
                     ("open_loops", "user_id"),
                     ("summary_sessions", "user_id"),
                     ("usage_metrics", "user_id"),

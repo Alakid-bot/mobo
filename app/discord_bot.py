@@ -47,7 +47,6 @@ _SUMMARY_COOLDOWN_LIMIT = 4096
 _SUMMARY_COOLDOWN_TTL = 86_400.0
 _RELAY_USER_MENTION = re.compile(r"@!?(\d{15,22})(?!\d)")
 _RELAY_USER_MENTION_LIMIT = 3
-_MANUAL_SEPARATOR = re.compile(r"[,，、;；\n]+")
 _PRIVATE_MEMORY_REQUESTS = (
     re.compile(
         r"^(?:请)?(?:告诉我)?你(?:还)?记得(?:关于)?我(?:的)?(?:什么|哪些(?:事情|信息)?)?[吗呢？?]*$"
@@ -70,19 +69,6 @@ def _channel_id(interaction: discord.Interaction) -> str:
     if interaction.channel_id is None:
         raise app_commands.CheckFailure("这个命令需要在服务器频道中使用")
     return str(interaction.channel_id)
-
-
-def _manual_memory_text(content: str, *, max_chars: int, max_keywords: int) -> str:
-    keywords = [" ".join(part.split()) for part in _MANUAL_SEPARATOR.split(content)]
-    keywords = list(dict.fromkeys(part for part in keywords if part))
-    if not keywords:
-        raise ValueError("请输入至少一个关键词")
-    if len(keywords) > max_keywords:
-        raise ValueError(f"最多允许 {max_keywords} 个关键词")
-    normalized = "、".join(keywords)
-    if len(normalized) > max_chars:
-        raise ValueError(f"主动记忆最多 {max_chars} 个字符")
-    return normalized
 
 
 def _chunks(text: str, limit: int = MAX_DISCORD_MESSAGE) -> list[str]:
@@ -175,70 +161,6 @@ class ChineseCommandTree(app_commands.CommandTree):
             await interaction.response.send_message(message, ephemeral=True)
 
 
-class RememberOverwriteView(discord.ui.View):
-    def __init__(
-        self,
-        bot: MoboBot,
-        user_id: str,
-        content: str,
-        *,
-        event_epoch: int,
-        max_chars: int,
-        max_keywords: int,
-    ) -> None:
-        super().__init__(timeout=60)
-        self.bot = bot
-        self.state = bot.state
-        self.user_id = user_id
-        self.content = content
-        self.event_epoch = event_epoch
-        self.max_chars = max_chars
-        self.max_keywords = max_keywords
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if str(interaction.user.id) != self.user_id:
-            await interaction.response.send_message("这不是你的确认按钮。", ephemeral=True)
-            return False
-        return True
-
-    def _disable(self) -> None:
-        for child in self.children:
-            child.disabled = True
-
-    @discord.ui.button(label="确认覆盖", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        ticket = await self.bot._admit_user_event(
-            (self.user_id,), expected_epochs={self.user_id: self.event_epoch}
-        )
-        if ticket is None:
-            self._disable()
-            await interaction.response.edit_message(
-                content="这次覆盖确认已失效，请重新使用 `/记住`。", view=self
-            )
-            self.stop()
-            return
-        try:
-            saved = await self.state.memories.set_manual(
-                self.user_id,
-                self.content,
-                max_chars=self.max_chars,
-                max_keywords=self.max_keywords,
-            )
-        finally:
-            await self.bot._release_user_event(ticket)
-        self._disable()
-        await interaction.response.edit_message(
-            content=f"已覆盖你的全局主动关键词：{saved['text']}", view=self
-        )
-        self.stop()
-
-    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self._disable()
-        await interaction.response.edit_message(content="已取消，原关键词保持不变。", view=self)
-        self.stop()
-
-
 class ForgetMeView(discord.ui.View):
     def __init__(self, bot: MoboBot, user_id: str) -> None:
         super().__init__(timeout=60)
@@ -269,7 +191,7 @@ class ForgetMeView(discord.ui.View):
         self._disable()
         await interaction.response.edit_message(
             content=(
-                "已删除你在所有服务器和私信范围中的消息记录、主动关键词、自动记忆、"
+                "已删除你在所有服务器和私信范围中的消息记录、自动记忆、"
                 "关系、偏好画像与运行数据。Discord 中已经发送出去的消息不由 mobo 删除。"
             ),
             view=self,
@@ -290,7 +212,7 @@ class PublicCommands(commands.Cog):
 
     @app_commands.command(name="帮助", description="查看你可以使用的中文命令")
     async def help(self, interaction: discord.Interaction) -> None:
-        public = "`/记住` `/我的记忆` `/忘记我` `/隐私` `/关系` `/喜好`"
+        public = "`/隐私` `/忘记我`\n平时直接聊天就行，mobo 会自己记住该记住的"
         try:
             is_admin = await self.state.discord_admins.is_admin(interaction.user.id)
         except ValueError:
@@ -305,94 +227,12 @@ class PublicCommands(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="记住", description="设置你全局唯一的一条主动关键词记忆")
-    @app_commands.describe(content="使用逗号、顿号、分号或换行分隔关键词")
-    @app_commands.rename(content="关键词")
-    async def remember(self, interaction: discord.Interaction, content: str) -> None:
-        user_id = str(interaction.user.id)
-        ticket = await self.bot._admit_user_event((user_id,))
-        if ticket is None:
-            await interaction.response.send_message(
-                "你的数据删除正在进行，请稍后重新使用 `/记住`。", ephemeral=True
-            )
-            return
-        try:
-            config = await self.state.runtime.all()
-            max_chars = int(config["manual_memory_max_chars"])
-            max_keywords = int(config["manual_memory_max_keywords"])
-            checked = await self.state.safety.check_input(content, user_id=user_id)
-            if not checked.allowed:
-                await interaction.response.send_message(SAFE_REFUSAL, ephemeral=True)
-                return
-            try:
-                normalized = _manual_memory_text(
-                    checked.text, max_chars=max_chars, max_keywords=max_keywords
-                )
-            except ValueError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
-                return
-            old = await self.state.memories.manual_for_user(user_id)
-            if old is not None:
-                view = RememberOverwriteView(
-                    self.bot,
-                    user_id,
-                    normalized,
-                    event_epoch=ticket.epoch_for(user_id),
-                    max_chars=max_chars,
-                    max_keywords=max_keywords,
-                )
-                await interaction.response.send_message(
-                    f"你已有全局主动关键词：{old['normalized_text']}\n确认覆盖为：{normalized}",
-                    view=view,
-                    ephemeral=True,
-                )
-                return
-            saved = await self.state.memories.set_manual(
-                user_id, normalized, max_chars=max_chars, max_keywords=max_keywords
-            )
-            await interaction.response.send_message(
-                f"已保存你的全局主动关键词：{saved['text']}", ephemeral=True
-            )
-        finally:
-            await self.bot._release_user_event(ticket)
-
-    @app_commands.command(name="我的记忆", description="私密查看全局关键词和各服务器自动记忆")
-    async def my_memories(self, interaction: discord.Interaction) -> None:
-        user_id = str(interaction.user.id)
-        manual = await self.state.memories.manual_for_user(user_id)
-        automatic = [
-            row
-            for row in await self.state.memories.list_all_for_user(user_id, limit=100)
-            if row["kind"] != "explicit"
-        ]
-        lines = ["全局主动关键词：" + (str(manual["normalized_text"]) if manual else "尚未设置")]
-        if automatic:
-            lines.append("\n各服务器自动记忆：")
-            current_scope = ""
-            for row in automatic:
-                scope = str(row["guild_id"])
-                if scope != current_scope:
-                    current_scope = scope
-                    if scope.startswith("dm:"):
-                        label = "私信"
-                    else:
-                        guild = self.bot.get_guild(int(scope)) if scope.isdigit() else None
-                        label = getattr(guild, "name", None) or f"服务器 {scope}"
-                    lines.append(f"\n**{label}**")
-                lines.append(f"- {row['content']}")
-        else:
-            lines.append("\n各服务器自动记忆：暂无")
-        text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1870].rstrip() + "\n…其余内容已截断。"
-        await interaction.response.send_message(text, ephemeral=True)
-
     @app_commands.command(name="忘记我", description="删除你在 mobo 中的全部个人数据")
     async def forget_me(self, interaction: discord.Interaction) -> None:
         view = ForgetMeView(self.bot, str(interaction.user.id))
         await interaction.response.send_message(
             (
-                "这会永久删除你在所有服务器和私信范围中的消息记录、主动关键词、自动记忆、"
+                "这会永久删除你在所有服务器和私信范围中的消息记录、自动记忆、"
                 "关系、偏好画像与运行数据。Discord 已发送消息不会被删除。此操作不能撤销。"
             ),
             view=view,
@@ -412,41 +252,11 @@ class PublicCommands(commands.Cog):
             )
         )
         await interaction.response.send_message(
-            f"- 主动关键词是每位用户全局唯一一条；自动记忆和关系按服务器隔离。\n"
+            f"- 自动记忆和关系按服务器隔离。\n"
             f"- {history}。\n"
             f"- 私信处理目前{'开启' if config['dm_enabled'] else '关闭'}。\n"
             f"- 自动记忆{'开启' if config['memory_auto_extract'] else '关闭'}，只识别明确的第一人称自述。\n"
-            "- `/我的记忆` 可私密查看；`/忘记我` 会删除你在 mobo 中的全部个人数据。",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="关系", description="查看机器人与你在本服务器中的关系概况")
-    @app_commands.guild_only()
-    async def relationship(self, interaction: discord.Interaction) -> None:
-        guild_id = _guild_id(interaction)
-        config = await self.state.runtime.all()
-        relationship = await self.state.relationships.get(
-            guild_id,
-            str(interaction.user.id),
-            int(config["relationship_decay_days"]),
-        )
-        await interaction.response.send_message(
-            f"目前是：**{relationship.description}**\n"
-            f"互动次数：{relationship.interaction_count}\n"
-            "这些状态只用于微调语气，不会给你贴永久标签。",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="喜好", description="查看机器人当前形成的主题偏好")
-    @app_commands.guild_only()
-    async def preferences(self, interaction: discord.Interaction) -> None:
-        rows = await self.state.preferences.list(8)
-        lines = [
-            f"- {row['topic']} · {float(row['weight']):+.2f}{' · 已锁定' if row['locked'] else ''}"
-            for row in rows
-        ]
-        await interaction.response.send_message(
-            "我目前的主题倾向：\n" + ("\n".join(lines) if lines else "还没有形成明显偏好。"),
+            "- `/忘记我` 会删除你在 mobo 中的全部个人数据。",
             ephemeral=True,
         )
 
@@ -1327,7 +1137,7 @@ class MoboBot(commands.Bot):
             and self._message_allowed(user_id)
         ):
             await message.reply(
-                "为保护你的隐私，请使用 `/我的记忆` 私密查看我保存的个人记忆。",
+                "mobo 会通过平时聊天自然记住重要的事，不需要手动查看记忆列表。",
                 mention_author=False,
             )
             return

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.discord_bot import AdminCommands, MoboBot, PublicCommands, image_content
 
-PUBLIC_NAMES = {"帮助", "记住", "我的记忆", "忘记我", "隐私", "关系", "喜好"}
+PUBLIC_NAMES = {"帮助", "忘记我", "隐私"}
 ADMIN_NAMES = {"状态", "管理台", "清空频道", "人设", "频道设置", "主动发言", "重载配置"}
 
 

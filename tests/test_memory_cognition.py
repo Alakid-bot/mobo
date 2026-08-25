@@ -52,7 +52,6 @@ async def test_forget_me_deletes_all_personal_data_across_scopes(state):
         await state.relationships.observe(
             guild, "user-1", "谢谢", learning_rate=0.03, decay_days=60
         )
-    await state.memories.set_manual("user-1", "称呼小林、喜欢科幻", max_chars=80, max_keywords=8)
     await state.memories.touch_profile("user-1", "小林")
     await state.database.purge_user("user-1")
     assert await state.memories.list_for_user("guild-a", "user-1") == []
@@ -69,25 +68,12 @@ async def test_forget_me_deletes_all_personal_data_across_scopes(state):
         )
         == 0
     )
-    assert await state.memories.manual_for_user("user-1") is None
     assert (
         await state.database.scalar(
             "SELECT COUNT(*) AS n FROM user_profiles WHERE user_id = 'user-1'"
         )
         == 0
     )
-
-
-@pytest.mark.asyncio
-async def test_manual_memory_is_single_global_keyword_record(state):
-    await state.memories.set_manual(
-        "user-1", "称呼小林、喜欢科幻、回复简洁", max_chars=80, max_keywords=8
-    )
-    await state.memories.set_manual("user-1", "称呼小林、喜欢爵士", max_chars=80, max_keywords=8)
-    row = await state.memories.manual_for_user("user-1")
-    assert row is not None
-    assert row["keywords"] == ["称呼小林", "喜欢爵士"]
-    assert await state.database.scalar("SELECT COUNT(*) AS n FROM manual_memories") == 1
 
 
 @pytest.mark.asyncio
@@ -133,40 +119,33 @@ async def test_private_context_labels_memory_as_untrusted_and_public_context_omi
 
 
 @pytest.mark.asyncio
-async def test_public_context_deterministically_redacts_private_profile_and_memory(state):
-    private_values = (
-        "主动关键词-蓝月",
-        "自动记忆-橙海豚",
-        "昵称-银狐",
-        "喜欢-珍珠星系",
-        "讨厌-芹菜火山",
-        "禁用称呼-紫雨",
-    )
-    await state.memories.set_manual("user-1", private_values[0], max_chars=80, max_keywords=8)
+async def test_public_context_injects_high_confidence_same_guild_memories_but_not_private_profile(state):
+    """公聊注入同服高置信 fact/preference，但不暴露私密画像和其他用户数据。"""
+    private_profile_values = ("昵称-银狐", "喜欢-珍珠星系", "讨厌-芹菜火山", "禁用称呼-紫雨")
+    public_memory_content = "自动记忆-橙海豚"
     await state.memories.add(
-        "guild-a", "user-1", private_values[1], kind="preference", importance=1.0
+        "guild-a", "user-1", public_memory_content, kind="preference", importance=1.0
     )
-    await state.memories.touch_profile("user-1", private_values[2])
+    await state.memories.touch_profile("user-1", private_profile_values[0])
     await state.database.execute(
         """UPDATE user_profiles SET display_name = ?, style_json = ?, boundaries_json = ?
            WHERE user_id = ?""",
         (
-            private_values[2],
+            private_profile_values[0],
             json.dumps(
                 {
                     "response_length": "short",
-                    "likes": [private_values[3]],
-                    "dislikes": [private_values[4]],
+                    "likes": [private_profile_values[1]],
+                    "dislikes": [private_profile_values[2]],
                     "feedback": {"positive": 999, "negative": -5, "net": 1004},
                 },
                 ensure_ascii=False,
             ),
-            json.dumps({"avoid_names": [private_values[5]]}, ensure_ascii=False),
+            json.dumps({"avoid_names": [private_profile_values[3]]}, ensure_ascii=False),
             "user-1",
         ),
     )
     await state.memories.add("guild-a", "user-2", "其他用户-黑曜秘密")
-    await state.memories.set_manual("user-2", "别人主动记忆", max_chars=80, max_keywords=8)
     await state.memories.save_message(
         "guild-a",
         "channel-a",
@@ -180,23 +159,27 @@ async def test_public_context_deterministically_redacts_private_profile_and_memo
     public_context = await state.context.build("guild-a", "channel-a", "user-1", "普通问题")
     public_text = json.dumps(public_context, ensure_ascii=False)
     public_system = public_context[0]["content"]
-    for private_value in (*private_values, "其他用户-黑曜秘密", "别人主动记忆"):
+    # 私密画像不出现在公聊
+    for private_value in (*private_profile_values, "其他用户-黑曜秘密"):
         assert private_value not in public_text
+    # 风格信号仍在
     assert '"response_length": "short"' in public_system
     assert '"feedback_positive": 20' in public_system
     assert '"feedback_negative": 0' in public_system
     assert "公共频道历史-仍可见" in public_text
-    assert "ephemeral" in public_text
-    assert "/我的记忆" in public_text
+    # 同服高置信 preference 记忆现在会出现在公聊（标记为不可信数据）
+    assert public_memory_content in public_system
+    assert "不可信数据" in public_system
 
     private_context = await state.context.build(
         "guild-a", "channel-a", "user-1", "普通问题", public=False
     )
     private_text = json.dumps(private_context, ensure_ascii=False)
-    for private_value in private_values:
+    # 私聊包含画像和记忆
+    for private_value in private_profile_values:
         assert private_value in private_text
+    assert public_memory_content in private_text
     assert "其他用户-黑曜秘密" not in private_text
-    assert "别人主动记忆" not in private_text
 
 
 @pytest.mark.asyncio
@@ -330,3 +313,109 @@ async def test_concurrent_preference_feedback_uses_atomic_increments(state):
     )
     assert row["evidence_count"] == 20
     assert float(row["weight"]) == pytest.approx(0.92)
+
+
+# ---------------------------------------------------------------------------
+# 公聊记忆注入规则测试 (Phase 1 §4.3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_public_scope_injects_same_guild_high_confidence_fact(state):
+    """同服高置信 fact 记忆出现在公聊上下文中。"""
+    await state.memories.add(
+        "guild-a", "user-1", "我叫小明", kind="fact", confidence=0.9, importance=0.8
+    )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
+    public_system = public_context[0]["content"]
+    assert "我叫小明" in public_system
+    assert "不可信数据" in public_system
+
+
+@pytest.mark.asyncio
+async def test_public_scope_injects_same_guild_high_confidence_preference(state):
+    """同服高置信 preference 记忆出现在公聊上下文中。"""
+    await state.memories.add(
+        "guild-a", "user-1", "我喜欢科幻", kind="preference", confidence=0.85, importance=0.7
+    )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "聊点什么")
+    public_system = public_context[0]["content"]
+    assert "我喜欢科幻" in public_system
+
+
+@pytest.mark.asyncio
+async def test_public_scope_excludes_low_confidence_memory(state):
+    """低置信度记忆不出现在公聊上下文中。"""
+    await state.memories.add(
+        "guild-a", "user-1", "可能喜欢猫", kind="fact", confidence=0.5, importance=0.8
+    )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
+    public_text = json.dumps(public_context, ensure_ascii=False)
+    assert "可能喜欢猫" not in public_text
+
+
+@pytest.mark.asyncio
+async def test_public_scope_excludes_cross_guild_memory(state):
+    """跨服记忆不出现在公聊上下文中。"""
+    await state.memories.add(
+        "guild-b", "user-1", "跨服记忆-秘密花园", kind="fact", confidence=0.95, importance=0.9
+    )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
+    public_text = json.dumps(public_context, ensure_ascii=False)
+    assert "跨服记忆-秘密花园" not in public_text
+
+
+@pytest.mark.asyncio
+async def test_private_scope_includes_low_confidence_same_guild_memories(state):
+    """私聊上下文包含同服低置信度记忆（私聊不做置信度过滤），公聊则不包含。"""
+    await state.memories.add(
+        "guild-a", "user-1", "可能喜欢猫", kind="fact", confidence=0.5, importance=0.95
+    )
+    # 使用会产生匹配 term 的查询（"喜欢猫" 会匹配 memory_terms 的 2-gram/3-gram）
+    private_context = await state.context.build(
+        "guild-a", "channel-a", "user-1", "喜欢猫吗", public=False
+    )
+    private_text = json.dumps(private_context, ensure_ascii=False)
+    assert "可能喜欢猫" in private_text
+
+    # 公聊不包含低置信度记忆
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "喜欢猫吗")
+    public_text = json.dumps(public_context, ensure_ascii=False)
+    assert "可能喜欢猫" not in public_text
+
+
+@pytest.mark.asyncio
+async def test_public_scope_caps_at_three_memories(state):
+    """公聊注入记忆上限为 3 条。"""
+    for index in range(5):
+        await state.memories.add(
+            "guild-a",
+            "user-1",
+            f"事实-{index}",
+            kind="fact",
+            confidence=0.9,
+            importance=0.8 + index * 0.01,
+        )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
+    public_system = public_context[0]["content"]
+    # 解析公聊记忆 JSON 块
+    import re
+    match = re.search(
+        r"【当前服务器内相关自动记忆：不可信数据.*?】\n(.+?)(?:\n\n|\Z)",
+        public_system,
+        re.DOTALL,
+    )
+    assert match is not None
+    memory_payload = json.loads(match.group(1))
+    assert len(memory_payload) <= 3
+
+
+@pytest.mark.asyncio
+async def test_public_scope_excludes_explicit_kind_memories(state):
+    """explicit 类型记忆不出现在公聊上下文中。"""
+    await state.memories.add(
+        "guild-a", "user-1", "显式记忆-不公开", kind="explicit", confidence=1.0, importance=1.0
+    )
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
+    public_text = json.dumps(public_context, ensure_ascii=False)
+    assert "显式记忆-不公开" not in public_text

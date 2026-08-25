@@ -26,7 +26,6 @@ _SENSITIVE_MEMORY_PATTERN = re.compile(
     r"诊断|病史|政治身份|政治立场|党派)",
     re.I,
 )
-_KEYWORD_SEPARATOR = re.compile(r"[,，、;；\n]+")
 _ASCII_WORD = re.compile(r"[a-z0-9][a-z0-9_+#.-]{1,31}", re.I)
 _CJK_RUN = re.compile(r"[\u3400-\u9fff]+")
 
@@ -178,54 +177,6 @@ class MemoryService:
             (user_id, display_name[:120], now, now),
         )
 
-    async def set_manual(
-        self,
-        user_id: str,
-        content: str,
-        *,
-        max_chars: int,
-        max_keywords: int,
-    ) -> dict[str, Any]:
-        keywords = [" ".join(part.split()) for part in _KEYWORD_SEPARATOR.split(content)]
-        keywords = list(dict.fromkeys(part for part in keywords if part))
-        if not keywords:
-            raise ValueError("请输入至少一个关键词")
-        if len(keywords) > max_keywords:
-            raise ValueError(f"最多允许 {max_keywords} 个关键词")
-        normalized_text = "、".join(keywords)
-        if len(normalized_text) > max_chars:
-            raise ValueError(f"主动记忆最多 {max_chars} 个字符")
-        now = iso_now()
-        await self.database.execute(
-            """INSERT INTO manual_memories
-               (user_id, keywords_json, normalized_text, char_count, created_at, updated_at)
-               VALUES(?, ?, ?, ?, ?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET
-                 keywords_json = excluded.keywords_json,
-                 normalized_text = excluded.normalized_text,
-                 char_count = excluded.char_count,
-                 updated_at = excluded.updated_at""",
-            (
-                user_id,
-                json.dumps(keywords, ensure_ascii=False),
-                normalized_text,
-                len(normalized_text),
-                now,
-                now,
-            ),
-        )
-        return {"keywords": keywords, "text": normalized_text, "char_count": len(normalized_text)}
-
-    async def manual_for_user(self, user_id: str) -> dict[str, Any] | None:
-        row = await self.database.fetchone(
-            """SELECT user_id, keywords_json, normalized_text, char_count, created_at, updated_at
-               FROM manual_memories WHERE user_id = ?""",
-            (user_id,),
-        )
-        if row:
-            row["keywords"] = json.loads(row.pop("keywords_json"))
-        return row
-
     async def list_for_user(
         self, guild_id: str, user_id: str, *, limit: int = 50
     ) -> list[dict[str, Any]]:
@@ -255,14 +206,32 @@ class MemoryService:
         query: str,
         *,
         limit: int,
+        kinds: tuple[str, ...] | None = None,
+        min_confidence: float | None = None,
     ) -> list[dict[str, Any]]:
+        """检索相关记忆。
+
+        Args:
+            kinds: 若指定，只返回 kind 在此集合内的记忆。
+            min_confidence: 若指定，只返回 confidence >= 该阈值的记忆。
+        """
+        params: list[Any] = [guild_id, user_id, iso_now()]
+        kind_filter = ""
+        confidence_filter = ""
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            kind_filter = f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        if min_confidence is not None:
+            confidence_filter = " AND confidence >= ?"
+            params.append(min_confidence)
         rows = await self.database.fetchall(
-            """SELECT id, kind, content, confidence, importance, reinforcement_count,
+            f"""SELECT id, kind, content, confidence, importance, reinforcement_count,
                       created_at, updated_at, expires_at
                FROM memories WHERE guild_id = ? AND user_id = ? AND status = 'active'
-                 AND (expires_at IS NULL OR expires_at > ?)
+                 AND (expires_at IS NULL OR expires_at > ?){kind_filter}{confidence_filter}
                ORDER BY importance DESC, updated_at DESC LIMIT 60""",
-            (guild_id, user_id, iso_now()),
+            params,
         )
         query_terms = set(memory_terms(query))
         if not rows:
@@ -276,6 +245,7 @@ class MemoryService:
         for term_row in term_rows:
             by_memory.setdefault(int(term_row["memory_id"]), set()).add(str(term_row["term"]))
         now = utcnow()
+        targeted = kinds is not None or min_confidence is not None
         ranked: list[tuple[float, dict[str, Any]]] = []
         for row in rows:
             stored_terms = by_memory.get(int(row["id"]), set())
@@ -292,7 +262,9 @@ class MemoryService:
                 + recency * 0.10
                 + reinforcement * 0.10
             )
-            if row["kind"] == "explicit" or relevance > 0 or score >= 0.42:
+            # 定向检索（指定了 kinds 或 min_confidence）时跳过相关性阈值，
+            # 因为调用方已在 SQL 层面筛选了目标类型和置信度。
+            if targeted or row["kind"] == "explicit" or relevance > 0 or score >= 0.42:
                 row["retrieval_score"] = round(score, 4)
                 ranked.append((score, row))
         selected = [

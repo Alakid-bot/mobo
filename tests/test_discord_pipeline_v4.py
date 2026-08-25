@@ -149,7 +149,7 @@ async def test_allowlist_is_actual_runtime_authority(state):
 
 
 @pytest.mark.asyncio
-async def test_help_hides_status_from_members_and_has_no_chat_tail(state):
+async def test_help_hides_status_from_members_and_lists_only_remaining_commands(state):
     bot = MoboBot(state)
     cog = PublicCommands(bot)
     member = FakeInteraction(111111111111111)
@@ -159,7 +159,12 @@ async def test_help_hides_status_from_members_and_has_no_chat_tail(state):
 
     member_text = member.response.messages[0][0]
     assert "`/状态`" not in member_text
-    assert "也可以提及我或回复我的消息来聊天" not in member_text
+    assert "平时直接聊天就行" in member_text
+    assert "`/隐私`" in member_text
+    assert "`/忘记我`" in member_text
+    assert "`/记住`" not in member_text
+    assert "`/关系`" not in member_text
+    assert "`/喜好`" not in member_text
 
     admin = FakeInteraction(222222222222222)
     state.discord_admins.is_admin = AsyncMock(return_value=True)
@@ -493,26 +498,6 @@ async def test_forget_me_barrier_prevents_inflight_message_writeback(state):
 
 
 @pytest.mark.asyncio
-async def test_forget_me_invalidates_previously_issued_remember_overwrite(state):
-    user_id = "111111111111111"
-    await state.memories.set_manual(user_id, "旧关键词", max_chars=80, max_keywords=8)
-    bot = MoboBot(state)
-    cog = PublicCommands(bot)
-    command_interaction = FakeInteraction(int(user_id))
-
-    await cog.remember.callback(cog, command_interaction, "新关键词")
-    view = command_interaction.response.messages[0][1]["view"]
-    await bot.purge_user_data(user_id)
-
-    confirm_interaction = FakeInteraction(int(user_id))
-    button = next(child for child in view.children if child.label == "确认覆盖")
-    await button.callback(confirm_interaction)
-
-    assert await state.memories.manual_for_user(user_id) is None
-    assert "已失效" in confirm_interaction.response.edits[0][0]
-
-
-@pytest.mark.asyncio
 async def test_reaction_with_stale_origin_lookup_cannot_revive_purged_user(state):
     bot, _bot_user, _channel = await _ready_bot(state)
     origin_user_id = "111111111111111"
@@ -704,7 +689,7 @@ async def test_intent_and_social_awareness_switches_control_pipeline(state):
 
 
 @pytest.mark.asyncio
-async def test_public_personal_memory_request_uses_private_command_without_model(state):
+async def test_public_personal_memory_request_gently_redirects_without_model(state):
     bot, bot_user, channel = await _ready_bot(state)
     state.llm.complete = AsyncMock(return_value=_model_result("recent context answer"))
     user = FakeUser(111111111111111)
@@ -714,7 +699,7 @@ async def test_public_personal_memory_request_uses_private_command_without_model
     )
 
     state.llm.complete.assert_not_awaited()
-    assert "/我的记忆" in channel.sent[-1].content
+    assert "自然记住" in channel.sent[-1].content
 
     await bot.on_message(
         FakeMessage(
