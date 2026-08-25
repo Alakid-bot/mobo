@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random as _random
 import re
 import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import discord
@@ -507,6 +508,10 @@ class MoboBot(commands.Bot):
         self._purge_lock = asyncio.Lock()
         self._identity_sync_lock = asyncio.Lock()
         self._closing = False
+        # 轻量反应状态（内存态，重启清零）
+        self._reaction_cooldowns: dict[str, float] = {}   # channel_id → last reaction timestamp
+        self._reaction_daily_count: int = 0
+        self._reaction_daily_date: date | None = None
 
     async def setup_hook(self) -> None:
         await self.add_cog(PublicCommands(self))
@@ -1181,6 +1186,8 @@ class MoboBot(commands.Bot):
                 guild_id, channel_id, user_id, safety.text, config
             )
             if not decision.should_speak:
+                # 轻量反应：闸门分数落在 [reaction_min_score, gate_threshold) 区间
+                await self._maybe_react(message, decision, config)
                 return
             proactive_reason = decision.reason
 
@@ -1305,28 +1312,78 @@ class MoboBot(commands.Bot):
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
             result = self._coerce_model_result(result, payload.config, context)
-            checked = await self.state.safety.check_output(
-                result.text,
-                guild_id=payload.guild_id,
-                channel_id=payload.channel_id,
-                user_id=payload.user_id,
-            )
-            output = checked.text if checked.allowed else SAFE_REFUSAL
-            if not self._is_current_generation(key, payload):
-                raise asyncio.CancelledError
-            public_output = output
-            if payload.mention_user_ids:
-                mention_prefix = " ".join(f"<@{user_id}>" for user_id in payload.mention_user_ids)
-                public_output = f"{mention_prefix} {output}"
-            sent = await self._send_public_reply(
-                message, public_output, mention_user_ids=payload.mention_user_ids
-            )
+            # ── 拟人化流程：碎句拆分 → 错别字 → safety → 发送 ──────
+            from app.humanize import fragments as humanize_fragments, typing_delay
+
+            humanization_on = bool(payload.config.get("humanization_enabled", False))
+            if humanization_on:
+                typo_rate = float(payload.config.get("typo_rate", 0.02))
+                max_frag = int(payload.config.get("max_fragments", 4))
+                typing_speed = float(payload.config.get("typing_speed", 12.0))
+                frags = humanize_fragments(result.text, typo_rate=typo_rate, max_fragments=max_frag)
+                # 逐碎片安全检查
+                checked_frags: list[str] = []
+                for frag in frags:
+                    checked = await self.state.safety.check_output(
+                        frag,
+                        guild_id=payload.guild_id,
+                        channel_id=payload.channel_id,
+                        user_id=payload.user_id,
+                    )
+                    if not checked.allowed:
+                        checked_frags = [SAFE_REFUSAL]
+                        break
+                    checked_frags.append(checked.text)
+                if not self._is_current_generation(key, payload):
+                    raise asyncio.CancelledError
+                mention_prefix = ""
+                if payload.mention_user_ids:
+                    mention_prefix = " ".join(f"<@{uid}>" for uid in payload.mention_user_ids) + " "
+                if checked_frags == [SAFE_REFUSAL]:
+                    output_frags = [SAFE_REFUSAL]
+                    save_frags = [SAFE_REFUSAL]
+                else:
+                    output_frags = [mention_prefix + checked_frags[0]] + checked_frags[1:]
+                    save_frags = checked_frags
+                # 计算延迟（总窗口 ≤12s）
+                raw_delays = [typing_delay(f, typing_speed=typing_speed) for f in output_frags]
+                total_delay = sum(raw_delays)
+                if total_delay > 12.0 and total_delay > 0:
+                    scale = 12.0 / total_delay
+                    raw_delays = [d * scale for d in raw_delays]
+                jitter = [_random.uniform(0.0, 0.3) for _ in raw_delays]
+                delays = [d + j for d, j in zip(raw_delays, jitter)]
+                sent = await self._send_public_reply(
+                    message,
+                    "",
+                    mention_user_ids=payload.mention_user_ids,
+                    fragments=output_frags,
+                    delays=delays,
+                )
+            else:
+                checked = await self.state.safety.check_output(
+                    result.text,
+                    guild_id=payload.guild_id,
+                    channel_id=payload.channel_id,
+                    user_id=payload.user_id,
+                )
+                output = checked.text if checked.allowed else SAFE_REFUSAL
+                if not self._is_current_generation(key, payload):
+                    raise asyncio.CancelledError
+                public_output = output
+                if payload.mention_user_ids:
+                    mention_prefix = " ".join(f"<@{user_id}>" for user_id in payload.mention_user_ids)
+                    public_output = f"{mention_prefix} {output}"
+                sent = await self._send_public_reply(
+                    message, public_output, mention_user_ids=payload.mention_user_ids
+                )
+                save_frags = _chunks(public_output)
             for sent_message in sent:
                 self._remember_bot_message(str(sent_message.id), payload.user_id, payload.guild_id)
             if not self._is_current_generation(key, payload):
                 raise asyncio.CancelledError
             if payload.listened and payload.config["save_raw_messages"]:
-                for sent_message, chunk in zip(sent, _chunks(public_output), strict=False):
+                for sent_message, chunk in zip(sent, save_frags, strict=False):
                     await self._save_message_idempotent(
                         payload.guild_id,
                         payload.channel_id,
@@ -1443,7 +1500,10 @@ class MoboBot(commands.Bot):
         text: str,
         *,
         mention_user_ids: tuple[int, ...] = (),
+        fragments: list[str] | None = None,
+        delays: list[float] | None = None,
     ) -> list[discord.Message]:
+        """发送回复，支持预拆分的碎片和每碎片延迟。"""
         sent: list[discord.Message] = []
         first_mentions = discord.AllowedMentions(
             everyone=False,
@@ -1451,7 +1511,10 @@ class MoboBot(commands.Bot):
             roles=False,
             replied_user=False,
         )
-        for index, chunk in enumerate(_chunks(text)):
+        chunks = fragments if fragments is not None else _chunks(text)
+        for index, chunk in enumerate(chunks):
+            if delays and index > 0 and index - 1 < len(delays):
+                await asyncio.sleep(delays[index - 1])
             if index == 0:
                 sent.append(
                     await source.reply(
@@ -1841,6 +1904,72 @@ class MoboBot(commands.Bot):
             origin_user_id = str(row["user_id"]) if row["user_id"] is not None else None
             guild_id = str(row["guild_id"])
         return origin_user_id, guild_id
+
+    # ── 轻量反应 ──────────────────────────────────────────────────────
+    _REACTION_COOLDOWN_SECONDS = 600.0   # 每频道 10 分钟
+    _REACTION_DAILY_CAP = 200
+
+    async def _maybe_react(
+        self,
+        message: discord.Message,
+        decision: Any,
+        config: dict[str, Any],
+    ) -> None:
+        """闸门未达标时，以概率给消息点一个表情。"""
+        if not config.get("reaction_enabled", False):
+            return
+        score = decision.score
+        min_score = int(config.get("reaction_min_score", 40))
+        gate_threshold = int(config.get("gate_threshold", 80))
+        if score < min_score or score >= gate_threshold:
+            return
+        # 不反应 bot 和自身消息
+        if message.author.bot:
+            return
+        if self.user is not None and message.author.id == self.user.id:
+            return
+        # 概率
+        probability = float(config.get("reaction_probability", 0.15))
+        if _random.random() >= probability:
+            return
+        # 每频道冷却
+        channel_key = str(message.channel.id)
+        now_mono = time.monotonic()
+        last = self._reaction_cooldowns.get(channel_key, 0.0)
+        if now_mono - last < self._REACTION_COOLDOWN_SECONDS:
+            return
+        # 日限
+        today = utcnow().date()
+        if self._reaction_daily_date != today:
+            self._reaction_daily_date = today
+            self._reaction_daily_count = 0
+        if self._reaction_daily_count >= self._REACTION_DAILY_CAP:
+            return
+        # 安静时段（复用主动发言配置）
+        try:
+            from app.behavior import ProactiveService
+
+            now_local = ProactiveService._local_now(config)
+            if ProactiveService._in_quiet_hours(
+                now_local,
+                str(config.get("proactive_quiet_start", "23:00")),
+                str(config.get("proactive_quiet_end", "08:00")),
+            ):
+                return
+        except Exception:
+            pass
+        # 选取表情
+        emoji_raw = str(config.get("reaction_emoji_set", "👍,😂,❤️,🤔"))
+        emoji_list = [e.strip() for e in emoji_raw.split(",") if e.strip()]
+        if not emoji_list:
+            return
+        chosen = _random.choice(emoji_list)
+        try:
+            await message.add_reaction(chosen)
+            self._reaction_cooldowns[channel_key] = now_mono
+            self._reaction_daily_count += 1
+        except Exception:
+            log.debug("reaction failed for message %s", message.id, exc_info=True)
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if self.user is not None and payload.user_id == self.user.id:

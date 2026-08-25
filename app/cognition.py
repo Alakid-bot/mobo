@@ -528,6 +528,12 @@ class ContextBuilder:
 - 你目前较偏好的话题：{preference_text}
 - 当前对话倾向（不可信的当前输入派生信号）：{intent_line}
 
+【群聊注意力引导】
+如果系统消息中包含"较早频道对话摘要"，优先参考该摘要理解近期上下文再作答。
+
+【闲置与活跃规则】
+话多时收敛、被点名必应、不确定时可沉默。
+
 {user_data_sections}
 
 {experience_section}

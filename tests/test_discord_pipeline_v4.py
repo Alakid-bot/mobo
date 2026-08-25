@@ -105,9 +105,13 @@ class FakeMessage:
         self.webhook_id = webhook_id
         self.reference = reference
         self.attachments: list[object] = []
+        self.reactions_added: list[str] = []
 
     async def reply(self, content: str, **kwargs: object) -> FakeSent:
         return await self.channel.send(content, **kwargs)
+
+    async def add_reaction(self, emoji: str) -> None:
+        self.reactions_added.append(emoji)
 
 
 class FakeResponse:
@@ -193,6 +197,7 @@ async def _ready_bot(state, *, output_terms: str = "") -> tuple[MoboBot, FakeUse
             "message_debounce_seconds": 0,
             "safety_output_terms": output_terms,
             "safety_default_action": "redact" if output_terms else "block",
+            "humanization_enabled": False,
         },
         actor="test",
     )

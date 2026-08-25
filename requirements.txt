@@ -9,3 +9,5 @@ argon2-cffi==25.1.0
 cryptography==50.0.0
 openai==2.54.0
 tzdata==2026.3
+jieba==0.42.1
+pypinyin==0.53.0

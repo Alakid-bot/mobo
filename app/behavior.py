@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.cognition import MoodService, PreferenceService, RelationshipService, clamp
 from app.database import Database, iso_now, utcnow
+from app.gate import score_gate
 
 
 class ChannelSettingsService:
@@ -95,6 +96,7 @@ class ProactiveDecision:
     should_speak: bool
     reason: str
     probability: float = 0.0
+    score: int = 0
 
 
 class ProactiveService:
@@ -235,6 +237,17 @@ class ProactiveService:
             return ProactiveDecision(False, "今日额度已用完")
         # Deciding whether to speak is observation, not feedback.  Learning here
         # would make mobo's preferences drift even when it ultimately stays quiet.
+        # ── 闸门评分（积分 ≥ 阈值直接触发，否则落回概率路径）─────────
+        bot_name = str(config.get("bot_name", "mobo"))
+        gate_score, gate_detail = score_gate(
+            content,
+            bot_name,
+            pending_count=0,
+            recent_self_messages=0,
+            recent_total_messages=0,
+        )
+        gate_threshold = int(config.get("gate_threshold", 80))
+
         interest, topics = await self.preferences.interest_for(content, learn=False)
         if config["relationship_enabled"]:
             relationship = await self.relationships.get(
@@ -256,8 +269,25 @@ class ProactiveService:
         probability *= 0.5 + social_budget
         probability *= 1.0 - fatigue * 0.7
         probability = clamp(probability, 0.0, 0.5)
+
+        # 闸门路径：分数达标则跳过概率判定
+        if gate_score >= gate_threshold:
+            reason = f"闸门({gate_detail})"
+            denied = await self._reserve_channel_slot(
+                guild_id,
+                channel_id,
+                reason,
+                now_utc=now_utc,
+                utc_start=utc_start,
+                cooldown_minutes=int(config["proactive_cooldown_minutes"]),
+                daily_limit=int(config["proactive_daily_limit"]),
+            )
+            if denied is not None:
+                return ProactiveDecision(False, denied, probability, gate_score)
+            return ProactiveDecision(True, reason, probability, gate_score)
+
         if self.random_value() >= probability:
-            return ProactiveDecision(False, "本次保持安静", probability)
+            return ProactiveDecision(False, "本次保持安静", probability, gate_score)
         reason = "偏好话题：" + "、".join(topics) if topics else "自然参与"
         denied = await self._reserve_channel_slot(
             guild_id,
@@ -269,8 +299,8 @@ class ProactiveService:
             daily_limit=int(config["proactive_daily_limit"]),
         )
         if denied is not None:
-            return ProactiveDecision(False, denied, probability)
-        return ProactiveDecision(True, reason, probability)
+            return ProactiveDecision(False, denied, probability, gate_score)
+        return ProactiveDecision(True, reason, probability, gate_score)
 
     async def soft_budget_reached(
         self, config: dict[str, Any], *, now: datetime | None = None
