@@ -420,3 +420,58 @@ async def test_public_scope_excludes_explicit_kind_memories(state):
     public_context = await state.context.build("guild-a", "channel-a", "user-1", "你好")
     public_text = json.dumps(public_context, ensure_ascii=False)
     assert "显式记忆-不公开" not in public_text
+
+
+@pytest.mark.asyncio
+async def test_candidate_expiry_and_reinforcement_extension(state):
+    """候选期：新记忆短期保留；再次出现延长到完整保留期。"""
+    from datetime import datetime, timedelta
+
+    from app.database import utcnow
+
+    config = await state.runtime.all()
+    await state.memories.auto_extract(
+        "guild-a",
+        "user-1",
+        "顺便说一下，我很喜欢深夜听古典音乐。",
+        confidence_threshold=config["memory_confidence_threshold"],
+        expires_days=180,
+        max_per_user=80,
+        candidate_expiry_days=14,
+    )
+    row = await state.database.fetchone(
+        "SELECT expires_at FROM memories WHERE guild_id = 'guild-a' AND user_id = 'user-1'"
+    )
+    delta = datetime.fromisoformat(row["expires_at"]) - utcnow()
+    assert timedelta(days=13) <= delta <= timedelta(days=15)
+
+    # 同一事实再次出现 → 延长到完整保留期
+    await state.memories.auto_extract(
+        "guild-a",
+        "user-1",
+        "顺便说一下，我很喜欢深夜听古典音乐。",
+        confidence_threshold=config["memory_confidence_threshold"],
+        expires_days=180,
+        max_per_user=80,
+        candidate_expiry_days=14,
+    )
+    row2 = await state.database.fetchone(
+        "SELECT expires_at FROM memories WHERE guild_id = 'guild-a' AND user_id = 'user-1'"
+    )
+    delta2 = datetime.fromisoformat(row2["expires_at"]) - utcnow()
+    assert delta2 >= timedelta(days=179)
+
+
+@pytest.mark.asyncio
+async def test_public_confidence_floor_is_configurable(state):
+    """公聊注入的置信度门槛可通过设置调整。"""
+    await state.memories.add(
+        "guild-a", "user-1", "可能喜欢猫", kind="preference", confidence=0.9
+    )
+    await state.runtime.update({"memory_public_confidence_floor": 0.95}, actor="test")
+    public_context = await state.context.build("guild-a", "channel-a", "user-1", "喜欢猫吗")
+    assert "可能喜欢猫" not in json.dumps(public_context, ensure_ascii=False)
+
+    await state.runtime.update({"memory_public_confidence_floor": 0.8}, actor="test")
+    public_context2 = await state.context.build("guild-a", "channel-a", "user-1", "喜欢猫吗")
+    assert "可能喜欢猫" in json.dumps(public_context2, ensure_ascii=False)

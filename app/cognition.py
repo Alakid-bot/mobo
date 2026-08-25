@@ -435,7 +435,7 @@ class ContextBuilder:
                 query_text,
                 limit=3,
                 kinds=("fact", "preference"),
-                min_confidence=0.8,
+                min_confidence=float(config.get("memory_public_confidence_floor", 0.8)),
             )
             public_memory_payload = [
                 {"id": row["id"], "kind": row["kind"], "content": row["content"]}

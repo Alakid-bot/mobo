@@ -64,6 +64,7 @@ class MemoryService:
         importance: float = 0.8,
         expires_at: str | None = None,
         source_message_id: int | None = None,
+        reinforce_expires_at: str | None = None,
     ) -> int:
         content = " ".join(content.strip().split())[:500]
         if not content:
@@ -76,12 +77,22 @@ class MemoryService:
             (guild_id, user_id, content),
         )
         if existing:
-            await self.database.execute(
-                """UPDATE memories SET confidence = MAX(confidence, ?),
-                   importance = MAX(importance, ?), reinforcement_count = reinforcement_count + 1,
-                   last_confirmed_at = ?, updated_at = ? WHERE id = ?""",
-                (confidence, importance, iso_now(), iso_now(), existing["id"]),
-            )
+            if reinforce_expires_at is not None:
+                # 再次印证：延长过期（候选期 → 完整保留期）
+                await self.database.execute(
+                    """UPDATE memories SET confidence = MAX(confidence, ?),
+                       importance = MAX(importance, ?), reinforcement_count = reinforcement_count + 1,
+                       last_confirmed_at = ?, updated_at = ?, expires_at = ?
+                       WHERE id = ?""",
+                    (confidence, importance, iso_now(), iso_now(), reinforce_expires_at, existing["id"]),
+                )
+            else:
+                await self.database.execute(
+                    """UPDATE memories SET confidence = MAX(confidence, ?),
+                       importance = MAX(importance, ?), reinforcement_count = reinforcement_count + 1,
+                       last_confirmed_at = ?, updated_at = ? WHERE id = ?""",
+                    (confidence, importance, iso_now(), iso_now(), existing["id"]),
+                )
             await self._index_memory(int(existing["id"]), guild_id, user_id, content)
             return int(existing["id"])
         now = iso_now()
@@ -277,6 +288,7 @@ class MemoryService:
         expires_days: int,
         max_per_user: int,
         source_message_id: int | None = None,
+        candidate_expiry_days: int = 0,
     ) -> list[int]:
         # Deliberately conservative: only explicit first-person claims and no sensitive facts.
         if _SENSITIVE_MEMORY_PATTERN.search(content):
@@ -288,6 +300,13 @@ class MemoryService:
                 claim = match.group(0).strip(" ，。.!！?")
                 candidates.append((kind, claim, 0.86))
         created: list[int] = []
+        # 候选期：新记忆短期保留；再次出现时延长到完整保留期（捕获宽松，晋升严格）
+        new_expiry = (
+            Database.expiry_after(candidate_expiry_days)
+            if candidate_expiry_days and candidate_expiry_days > 0
+            else Database.expiry_after(expires_days)
+        )
+        reinforce_expiry = Database.expiry_after(expires_days)
         for kind, claim, confidence in candidates[:2]:
             if confidence < confidence_threshold:
                 continue
@@ -298,8 +317,9 @@ class MemoryService:
                 kind=kind,
                 confidence=confidence,
                 importance=0.55,
-                expires_at=Database.expiry_after(expires_days),
+                expires_at=new_expiry,
                 source_message_id=source_message_id,
+                reinforce_expires_at=reinforce_expiry,
             )
             created.append(memory_id)
         await self._enforce_limit(guild_id, user_id, max_per_user)

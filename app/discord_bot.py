@@ -1617,6 +1617,7 @@ class MoboBot(commands.Bot):
                     expires_days=int(config["memory_decay_days"]),
                     max_per_user=int(config["memory_max_per_user"]),
                     source_message_id=payload.source_message_db_id,
+                    candidate_expiry_days=int(config["memory_candidate_expiry_days"]),
                 )
             if config["relationship_enabled"]:
                 await self.state.relationships.observe(
