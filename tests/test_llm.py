@@ -28,11 +28,6 @@ def config(provider: str = "openai") -> dict[str, Any]:
         "model_catalog_cache_minutes": 10,
         "openai_api_key": "test-openai-secret",
         "openai_base_url": "https://api.openai.com/v1",
-        "openrouter_api_key": "test-router-secret",
-        "openrouter_base_url": "https://openrouter.ai/api/v1",
-        "ollama_base_url": "http://localhost:11434/v1",
-        "anthropic_api_key": "test-anthropic-secret",
-        "admin_public_url": "https://mobo.example",
     }
 
 
@@ -111,35 +106,6 @@ class OpenAIFactory:
         return client
 
 
-class FakeAnthropicModels:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    # Deliberately omit `limit` to cover older SDK signatures.
-    async def list(self) -> Any:
-        self.calls += 1
-        return AsyncItems([SimpleNamespace(id="claude-z"), SimpleNamespace(id="claude-a")])
-
-
-class FakeAnthropicMessages:
-    async def create(self, **_: Any) -> Any:
-        return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text="连接正常")],
-            usage=SimpleNamespace(input_tokens=7, output_tokens=2),
-        )
-
-
-class FakeAnthropicClient:
-    def __init__(self, **kwargs: Any):
-        self.kwargs = kwargs
-        self.models = FakeAnthropicModels()
-        self.messages = FakeAnthropicMessages()
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-
 @pytest.mark.asyncio
 async def test_gateway_caches_by_model_config_selects_roles_and_closes() -> None:
     factory = OpenAIFactory()
@@ -189,21 +155,23 @@ async def test_complete_result_uses_one_call_and_actual_usage() -> None:
 async def test_text_stream_and_complete_remain_compatible() -> None:
     factory = OpenAIFactory()
     gateway = ModelGateway(openai_client_factory=factory)
-    backend = gateway.build_backend(config("openrouter"))
+    values = config()
+    values["openai_base_url"] = "https://compatible.example/v1"
+    backend = gateway.build_backend(values)
     messages = [{"role": "user", "content": "你好"}]
 
     assert "".join([part async for part in backend.stream(messages)]) == "连接正常"
     assert await backend.complete(messages) == "连接正常"
     assert len(factory.clients[0].completions.calls) == 2
     assert factory.clients[0].completions.calls[0]["max_tokens"] == 120
-    assert factory.clients[0].kwargs["default_headers"]["X-Title"] == "mobo"
+    assert "default_headers" not in factory.clients[0].kwargs
 
 
 @pytest.mark.asyncio
 async def test_openai_model_list_is_sorted_deduplicated_cached_and_forceable() -> None:
     factory = OpenAIFactory()
     gateway = ModelGateway(openai_client_factory=factory)
-    values = config("ollama")
+    values = config()
 
     assert await gateway.list_models(values) == ["a-model", "z-model"]
     assert await gateway.list_models(values) == ["a-model", "z-model"]
@@ -212,26 +180,10 @@ async def test_openai_model_list_is_sorted_deduplicated_cached_and_forceable() -
     assert factory.clients[0].models.calls == 2
 
 
-@pytest.mark.asyncio
-async def test_anthropic_list_and_completion_handle_sdk_shapes() -> None:
-    clients: list[FakeAnthropicClient] = []
-
-    def factory(**kwargs: Any) -> FakeAnthropicClient:
-        client = FakeAnthropicClient(**kwargs)
-        clients.append(client)
-        return client
-
-    gateway = ModelGateway(anthropic_client_factory=factory)
-    values = config("anthropic")
-
-    assert await gateway.list_models(values) == ["claude-a", "claude-z"]
-    result = await gateway.complete(values, [{"role": "user", "content": "测试"}])
-
-    assert result.text == "连接正常"
-    assert result.input_tokens == 7
-    assert result.output_tokens == 2
-    assert result.usage_estimated is False
-    assert clients[0].models.calls == 1
+@pytest.mark.parametrize("provider", ["anthropic", "openrouter", "ollama"])
+def test_legacy_provider_values_are_rejected(provider: str) -> None:
+    with pytest.raises(ValueError, match="OpenAI 兼容"):
+        ModelGateway(openai_client_factory=OpenAIFactory()).build_backend(config(provider))
 
 
 @pytest.mark.asyncio
@@ -286,8 +238,18 @@ async def test_legacy_base_complete_and_timeout_collection() -> None:
     assert await collect_with_timeout(backend, messages, 1) == "ab"
 
 
-def test_global_build_backend_still_validates_configuration() -> None:
+def test_blank_key_is_supported_for_no_auth_compatible_endpoints() -> None:
+    factory = OpenAIFactory()
+    gateway = ModelGateway(openai_client_factory=factory)
     values = config()
     values["openai_api_key"] = ""
-    with pytest.raises(ValueError, match="OpenAI API Key"):
+    gateway.build_backend(values)
+    assert values["openai_api_key"] == ""
+    assert factory.clients[0].kwargs["api_key"] == "not-required"
+
+
+def test_global_build_backend_still_validates_endpoint() -> None:
+    values = config()
+    values["openai_base_url"] = "file:///tmp/models"
+    with pytest.raises(ValueError, match="HTTP"):
         build_backend(values)

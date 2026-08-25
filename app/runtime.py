@@ -77,17 +77,12 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         "llm_provider",
-        "模型提供方",
+        "接口类型",
         "模型",
         "select",
         "openai",
-        "切换后立即用于新消息。",
-        options=(
-            ("openai", "OpenAI"),
-            ("anthropic", "Anthropic"),
-            ("openrouter", "OpenRouter"),
-            ("ollama", "Ollama / OpenAI 兼容"),
-        ),
+        "mobo 统一使用 OpenAI 兼容接口。",
+        options=(("openai", "OpenAI 兼容"),),
     ),
     SettingField(
         "llm_model", "快速聊天模型", "模型", "text", "gpt-4o-mini", "普通聊天使用的准确模型 ID。"
@@ -127,54 +122,20 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         "openai_api_key",
-        "OpenAI API Key",
+        "API Key",
         "模型",
         "secret",
         "",
-        "加密存入 SQLite；留空不会覆盖。",
-        secret=True,
-    ),
-    SettingField(
-        "anthropic_api_key",
-        "Anthropic API Key",
-        "模型",
-        "secret",
-        "",
-        "加密存入 SQLite；留空不会覆盖。",
-        secret=True,
-    ),
-    SettingField(
-        "openrouter_api_key",
-        "OpenRouter API Key",
-        "模型",
-        "secret",
-        "",
-        "加密存入 SQLite；留空不会覆盖。",
+        "加密存入 SQLite；无鉴权接口可以留空。",
         secret=True,
     ),
     SettingField(
         "openai_base_url",
-        "OpenAI 兼容地址",
+        "OpenAI 兼容端点",
         "模型",
         "text",
         "https://api.openai.com/v1",
-        "可填写代理或兼容 API；官方 OpenAI 保持默认。",
-    ),
-    SettingField(
-        "openrouter_base_url",
-        "OpenRouter 地址",
-        "模型",
-        "text",
-        "https://openrouter.ai/api/v1",
-        "通常无需修改。",
-    ),
-    SettingField(
-        "ollama_base_url",
-        "Ollama 地址",
-        "模型",
-        "text",
-        "http://localhost:11434/v1",
-        "Zeabur 单服务通常无法访问你电脑上的 localhost。",
+        "填写完整 API 根地址，例如 https://api.openai.com/v1。",
     ),
     SettingField(
         "llm_deep_model",
@@ -198,7 +159,7 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
         "模型",
         "number",
         10,
-        "减少重复拉取服务商模型列表。",
+        "减少重复拉取兼容接口的模型列表。",
         1,
         1440,
         1,
@@ -835,6 +796,73 @@ class RuntimeSettings:
                 )
             await connection.commit()
         self._cache = None
+        await self._migrate_legacy_model_connection()
+
+    async def _migrate_legacy_model_connection(self) -> None:
+        """Collapse old provider-specific settings into the one compatible connection."""
+
+        legacy_keys = (
+            "anthropic_api_key",
+            "openrouter_api_key",
+            "openrouter_base_url",
+            "ollama_base_url",
+        )
+        rows = await self.database.fetchall(
+            "SELECT key, value, is_secret FROM app_settings WHERE key IN (?, ?, ?, ?)",
+            legacy_keys,
+        )
+        current = await self.all(fresh=True)
+        provider = str(current.get("llm_provider") or "openai").strip().lower()
+        if provider == "openai" and not rows:
+            return
+
+        legacy: dict[str, Any] = {}
+        for row in rows:
+            value = json.loads(row["value"])
+            if row["is_secret"] and row["key"] == "openrouter_api_key" and provider == "openrouter":
+                value = self.cipher.decrypt(value)
+            legacy[str(row["key"])] = value
+
+        updates: dict[str, Any] = {"llm_provider": "openai"}
+        clear_secrets: set[str] = set()
+        if provider == "openrouter":
+            updates["openai_base_url"] = str(
+                legacy.get("openrouter_base_url") or "https://openrouter.ai/api/v1"
+            )
+            router_key = str(legacy.get("openrouter_api_key") or "")
+            if router_key:
+                updates["openai_api_key"] = router_key
+            else:
+                clear_secrets.add("openai_api_key")
+        elif provider == "ollama":
+            updates["openai_base_url"] = str(
+                legacy.get("ollama_base_url") or "http://localhost:11434/v1"
+            )
+            updates["openai_api_key"] = "ollama"
+        elif provider != "openai":
+            # Anthropic's native Messages API is not OpenAI compatible.  Do not
+            # silently send its key to another endpoint; require a fresh setup.
+            updates.update(
+                {
+                    "openai_base_url": "https://api.openai.com/v1",
+                    "llm_model": "",
+                    "llm_deep_model": "",
+                    "llm_utility_model": "",
+                }
+            )
+            clear_secrets.add("openai_api_key")
+
+        if provider != "openai":
+            await self.update(
+                updates,
+                actor="system:model-migration",
+                clear_secrets=clear_secrets,
+            )
+        if rows:
+            await self.database.execute(
+                "DELETE FROM app_settings WHERE key IN (?, ?, ?, ?)", legacy_keys
+            )
+            self._cache = None
 
     async def all(self, *, fresh: bool = False) -> dict[str, Any]:
         async with self._lock:

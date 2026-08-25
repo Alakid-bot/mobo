@@ -1,52 +1,53 @@
 {% extends "base.html" %}
-{% block title %}模型中心 · mobo 管理台{% endblock %}
+{% block title %}模型中心 · mobo{% endblock %}
 {% block crumb %}模型中心{% endblock %}
 {% block content %}
-<section class="page-heading">
-  <div><p class="eyebrow">MODEL CENTER</p><h1>拉取、测试，再启用模型</h1><p>测试成功前不会改变正在使用的模型。API Key 仍在“全部配置”中加密保存，这里不会显示它。深度聊天和后台整理模型必须跟随当前聊天提供方。</p></div>
-</section>
+<header class="page-heading">
+  <div><p class="eyebrow">OPENAI COMPATIBLE</p><h1>一个接口，全部模型。</h1><p>填写 OpenAI 兼容端点和 API Key，拉取模型并完成真实测试。只有测试成功后，连接和模型才会一起保存。</p></div>
+</header>
 
 <section class="panel">
-  <div class="panel-head"><div><p class="eyebrow">安全切换</p><h2>模型连接</h2></div><span data-model-state>尚未测试</span></div>
-  <form id="model-center-form" class="settings-form" data-chat-model="{{ config.llm_model }}" data-deep-model="{{ config.llm_deep_model }}" data-utility-model="{{ config.llm_utility_model }}">
+  <div class="panel-head"><div><p class="eyebrow">CONNECTION</p><h2>接口与模型</h2></div><span data-model-state>尚未测试</span></div>
+  <form id="model-center-form" class="stack-form" data-chat-model="{{ config.llm_model }}" data-deep-model="{{ config.llm_deep_model }}" data-utility-model="{{ config.llm_utility_model }}" data-key-configured="{{ 'true' if config.openai_api_key else 'false' }}">
     <div class="field-grid">
-      <label class="config-field"><span class="field-title">提供方</span><select name="provider">
-        <option value="openai" {{ 'selected' if config.llm_provider == 'openai' else '' }}>OpenAI</option>
-        <option value="anthropic" {{ 'selected' if config.llm_provider == 'anthropic' else '' }}>Anthropic</option>
-        <option value="openrouter" {{ 'selected' if config.llm_provider == 'openrouter' else '' }}>OpenRouter</option>
-        <option value="ollama" {{ 'selected' if config.llm_provider == 'ollama' else '' }}>Ollama / OpenAI 兼容</option>
-      </select><small>自定义接口地址和密钥在“全部配置”中维护；切换提供方后，深度和后台模型会安全回退到聊天模型。</small></label>
-      <label class="config-field"><span class="field-title">用途</span><select name="role">
-        <option value="chat">日常聊天</option>
-        <option value="deep">深度聊天</option>
-        <option value="utility">摘要与后台整理</option>
-      </select><small>三个用途可用不同模型，但深度和后台整理只能使用当前聊天提供方；如需跨提供方，请先切换聊天提供方。</small></label>
-      <label class="config-field wide"><span class="field-title">模型 ID</span><input name="model" list="model-options" maxlength="200" value="{{ config.llm_model }}" required placeholder="先拉取列表，或准确填写模型 ID"><datalist id="model-options"></datalist><small data-model-count>尚未拉取模型列表</small></label>
+      <label class="config-field wide"><span class="field-title">OpenAI 兼容端点</span><input name="base_url" type="url" value="{{ config.openai_base_url }}" placeholder="https://api.openai.com/v1" autocomplete="url" required><small>需要支持 <code>/models</code> 和 <code>/chat/completions</code>。端点会在模型测试成功后保存。</small></label>
+      <label class="config-field wide"><span class="field-title">API Key</span><span class="secret-input"><input name="api_key" type="password" value="" placeholder="{{ '已配置 · 留空继续使用' if config.openai_api_key else '无鉴权接口可留空' }}" autocomplete="new-password"><span>{{ 'SET' if config.openai_api_key else 'EMPTY' }}</span></span><small>密钥只会通过当前 HTTPS 会话提交，并加密保存；页面不会回显原值。</small></label>
+      <label class="clear-secret wide"><input name="clear_api_key" type="checkbox"> 清空已保存的 API Key（仅适合无鉴权接口）</label>
     </div>
-    <div class="save-dock">
-      <span>“测试连接”只发送固定的无隐私短句；“测试并启用”成功后才保存。</span>
-      <span><button type="button" class="text-button" data-model-discover>拉取模型</button><button type="button" class="text-button" data-model-test>测试连接</button><button type="button" class="primary-button" data-model-activate>测试并启用</button></span>
+    <div class="model-action-row">
+      <button type="button" class="small-button" data-model-discover>连接并拉取模型</button>
+      <span class="muted" data-model-count>尚未拉取模型列表</span>
+    </div>
+    <div class="field-grid model-selection">
+      <label class="config-field"><span class="field-title">模型用途</span><select name="role"><option value="chat">聊天回复</option><option value="deep">深度聊天</option><option value="utility">后台整理 / 总结</option></select><small>深度与后台模型留空时，会自动沿用聊天模型。</small></label>
+      <label class="config-field"><span class="field-title">模型 ID</span><input name="model" list="model-options" value="{{ config.llm_model }}" maxlength="200" autocomplete="off" required><datalist id="model-options"></datalist><small>从拉取结果中选择，也可以准确输入兼容服务返回的 ID。</small></label>
+    </div>
+    <div class="model-action-row">
+      <button type="button" class="small-button" data-model-test>仅测试</button>
+      <button type="button" class="primary-button" data-model-activate>测试并启用</button>
+      <span class="muted">更换连接时，请先启用“聊天回复”；成功后再配置其他用途。</span>
     </div>
   </form>
 </section>
 
-<div class="two-column align-start">
-  <section class="panel">
-    <div class="panel-head"><div><p class="eyebrow">最近 7 天</p><h2>模型用量</h2></div><span>{{ usage_7d.calls }} 次</span></div>
-    <dl class="security-list"><div><dt>输入 Token</dt><dd>{{ usage_7d.input_tokens }}</dd></div><div><dt>输出 Token</dt><dd>{{ usage_7d.output_tokens }}</dd></div><div><dt>平均耗时</dt><dd>{{ usage_7d.avg_latency_ms }} ms</dd></div><div><dt>失败</dt><dd>{{ usage_7d.errors }}</dd></div></dl>
-  </section>
-  <section class="panel">
-    <div class="panel-head"><div><p class="eyebrow">最近 30 天</p><h2>成本观察</h2></div><span>仅指标</span></div>
-    <dl class="security-list"><div><dt>调用</dt><dd>{{ usage_30d.calls }}</dd></div><div><dt>输入 Token</dt><dd>{{ usage_30d.input_tokens }}</dd></div><div><dt>输出 Token</dt><dd>{{ usage_30d.output_tokens }}</dd></div><div><dt>失败</dt><dd>{{ usage_30d.errors }}</dd></div></dl>
-    <p class="muted">这里只保存用量、耗时、模型和错误类别，不保存完整对话。</p>
-  </section>
+<section class="panel">
+  <div class="panel-head"><div><p class="eyebrow">GENERATION</p><h2>生成参数</h2></div><span>统一由模型中心管理</span></div>
+  <form id="model-settings-form" class="stack-form">
+    <div class="field-grid">
+      {% for field in model_tuning_fields %}
+      <label class="config-field"><span class="field-title">{{ field.label }}</span><input name="{{ field.key }}" type="number" value="{{ config[field.key] }}" min="{{ field.minimum }}" max="{{ field.maximum }}" step="{{ field.step }}"><small>{{ field.help }}</small></label>
+      {% endfor %}
+    </div>
+    <div class="model-action-row"><button type="submit" class="primary-button">保存生成参数</button></div>
+  </form>
+</section>
+
+<div class="metric-grid">
+  <article class="metric-card accent"><span>近 7 天 Token</span><strong>{{ usage_7d.input_tokens + usage_7d.output_tokens }}</strong><small>{{ usage_7d.calls }} 次模型调用</small></article>
+  <article class="metric-card"><span>近 30 天 Token</span><strong>{{ usage_30d.input_tokens + usage_30d.output_tokens }}</strong><small>失败 {{ usage_30d.errors }} 次</small></article>
+  <article class="metric-card"><span>聊天模型</span><strong style="font-size:16px">{{ config.llm_model or '未配置' }}</strong><small>实时对话</small></article>
+  <article class="metric-card"><span>后台模型</span><strong style="font-size:16px">{{ config.llm_utility_model or config.llm_model or '未配置' }}</strong><small>摘要与整理</small></article>
 </div>
 
-<section class="panel">
-  <div class="panel-head"><div><p class="eyebrow">30 天明细</p><h2>按用途与模型汇总</h2></div><span>{{ usage_rows|length }} 组</span></div>
-  <div class="data-table audit-table">
-    <div class="data-row header"><span>用途</span><span>提供方 / 模型</span><span>调用 / 状态</span><span>Token / 平均耗时</span></div>
-    {% for item in usage_rows %}<div class="data-row"><span>{{ item.kind }}</span><span>{{ item.provider or '未知' }}<small>{{ item.model or '未知' }}</small></span><span>{{ item.calls }} 次 · {{ item.status }}</span><span>{{ item.input_tokens + item.output_tokens }} Token · {{ item.avg_latency_ms }} ms</span></div>{% else %}<p class="empty">还没有模型用量记录。</p>{% endfor %}
-  </div>
-</section>
+<section class="panel"><div class="panel-head"><div><p class="eyebrow">USAGE / 30D</p><h2>模型用量</h2></div></div><div class="data-table audit-table"><div class="data-row header"><span>模型</span><span>用途</span><span>请求 / 状态</span><span>Token / 平均延迟</span></div>{% for row in usage_rows %}<div class="data-row"><strong>{{ row.model or '未记录' }}</strong><span>{{ row.kind }}</span><span>{{ row.calls }} / {{ '成功' if row.status == 'ok' else '失败' }}</span><span>{{ row.input_tokens + row.output_tokens }} / {{ row.avg_latency_ms }} ms</span></div>{% else %}<p class="empty">暂无用量记录。</p>{% endfor %}</div></section>
 {% endblock %}

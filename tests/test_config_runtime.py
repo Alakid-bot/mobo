@@ -64,6 +64,43 @@ async def test_blank_secret_does_not_overwrite_but_explicit_clear_does(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_legacy_openrouter_connection_is_migrated_and_removed(tmp_path):
+    database = Database(tmp_path / "legacy-model.db")
+    await database.initialize()
+    cipher = SecretCipher(Fernet.generate_key().decode())
+    runtime = RuntimeSettings(database, cipher)
+    await runtime.ensure_defaults()
+    await database.execute(
+        "UPDATE app_settings SET value = ? WHERE key = 'llm_provider'",
+        (json.dumps("openrouter"),),
+    )
+    await database.execute(
+        """INSERT INTO app_settings(key, value, is_secret, updated_at, updated_by)
+           VALUES('openrouter_api_key', ?, 1, '2026-01-01T00:00:00+00:00', 'legacy')""",
+        (json.dumps(cipher.encrypt("sk-router-secret")),),
+    )
+    await database.execute(
+        """INSERT INTO app_settings(key, value, is_secret, updated_at, updated_by)
+           VALUES('openrouter_base_url', ?, 0, '2026-01-01T00:00:00+00:00', 'legacy')""",
+        (json.dumps("https://openrouter.ai/api/v1"),),
+    )
+    runtime.invalidate()
+
+    await runtime._migrate_legacy_model_connection()
+
+    assert await runtime.get("llm_provider") == "openai"
+    assert await runtime.get("openai_base_url") == "https://openrouter.ai/api/v1"
+    assert await runtime.get("openai_api_key") == "sk-router-secret"
+    assert (
+        await database.scalar(
+            "SELECT COUNT(*) AS n FROM app_settings WHERE key LIKE 'openrouter_%'"
+        )
+        == 0
+    )
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_validation_rejects_unknown_and_out_of_range_fields(state):
     with pytest.raises(ValueError, match="未知配置项"):
         await state.runtime.update({"made_up": True}, actor="test")

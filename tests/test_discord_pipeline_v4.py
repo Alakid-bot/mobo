@@ -5,7 +5,6 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-import discord
 import pytest
 
 from app.conversation import SummaryRequest
@@ -148,50 +147,6 @@ async def test_forget_me_cancels_globally_before_purge(state):
 
     bot.purge_user_data.assert_awaited_once_with("111111111111111")
     assert "Discord" in interaction.response.edits[0][0]
-
-
-@pytest.mark.asyncio
-async def test_model_is_tested_before_configuration_is_persisted(state):
-    bot = MoboBot(state)
-    cog = AdminCommands(bot)
-    interaction = FakeInteraction(111111111111111)
-    state.discord_admins.is_admin = AsyncMock(return_value=True)
-    state.llm.test_model = AsyncMock(side_effect=RuntimeError("secret details"))
-    state.runtime.update = AsyncMock()
-    choice = discord.app_commands.Choice(name="OpenAI", value="openai")
-
-    await cog.model.callback(cog, interaction, choice, "candidate-model")
-
-    state.llm.test_model.assert_awaited_once()
-    state.runtime.update.assert_not_awaited()
-    assert "原配置保持不变" in interaction.response.messages[0][0]
-    assert "secret details" not in interaction.response.messages[0][0]
-
-
-@pytest.mark.asyncio
-async def test_provider_switch_clears_specialized_models_after_probe(state):
-    await state.runtime.update(
-        {
-            "llm_provider": "openai",
-            "llm_deep_model": "old-deep",
-            "llm_utility_model": "old-utility",
-        },
-        actor="test",
-    )
-    bot = MoboBot(state)
-    cog = AdminCommands(bot)
-    interaction = FakeInteraction(111111111111111)
-    state.discord_admins.is_admin = AsyncMock(return_value=True)
-    state.llm.test_model = AsyncMock(return_value=_model_result("连接正常"))
-    choice = discord.app_commands.Choice(name="OpenRouter", value="openrouter")
-
-    await cog.model.callback(cog, interaction, choice, "new-chat")
-
-    candidate = state.llm.test_model.await_args.args[0]
-    assert candidate["llm_deep_model"] == ""
-    assert candidate["llm_utility_model"] == ""
-    assert await state.runtime.get("llm_deep_model") == ""
-    assert await state.runtime.get("llm_utility_model") == ""
 
 
 async def _ready_bot(state, *, output_terms: str = "") -> tuple[MoboBot, FakeUser, FakeChannel]:

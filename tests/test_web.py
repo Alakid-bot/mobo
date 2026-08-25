@@ -73,6 +73,7 @@ async def test_login_renders_every_console_page_and_no_history_api_is_public(sta
         for path in (
             "/",
             "/settings",
+            "/models",
             "/behavior",
             "/memories",
             "/audit",
@@ -110,7 +111,19 @@ async def test_settings_api_requires_session_and_csrf(state):
 
 
 @pytest.mark.asyncio
-async def test_settings_api_cannot_bypass_model_center_but_allows_model_tuning(state):
+async def test_model_settings_api_requires_session_and_csrf(state):
+    app = create_web_app(state)
+    payload = {"values": {"llm_temperature": "0.4"}}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        assert (await client.post("/api/models/settings", json=payload)).status_code == 401
+        await login(client)
+        assert (await client.post("/api/models/settings", json=payload)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_all_model_configuration_is_exclusive_to_model_center(state):
     app = create_web_app(state)
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://testserver"
@@ -119,6 +132,7 @@ async def test_settings_api_cannot_bypass_model_center_but_allows_model_tuning(s
         csrf = await csrf_from(client)
         page = await client.get("/settings")
         assert 'data-key="llm_model"' not in page.text
+        assert 'data-key="llm_temperature"' not in page.text
         assert "模型中心" in page.text
 
         response = await client.post(
@@ -144,12 +158,17 @@ async def test_settings_api_cannot_bypass_model_center_but_allows_model_tuning(s
 
         response = await client.post(
             "/api/settings",
-            json={"values": {"llm_temperature": "0.2", "openai_base_url": "https://proxy.test/v1"}},
+            json={"values": {"llm_temperature": "0.2"}},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert response.status_code == 400
+        response = await client.post(
+            "/api/models/settings",
+            json={"values": {"llm_temperature": "0.2"}},
             headers={"X-CSRF-Token": csrf},
         )
         assert response.status_code == 200
         assert await state.runtime.get("llm_temperature") == 0.2
-        assert await state.runtime.get("openai_base_url") == "https://proxy.test/v1"
 
 
 @pytest.mark.asyncio

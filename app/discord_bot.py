@@ -26,7 +26,6 @@ from app.conversation import (
 )
 from app.database import iso_now, utcnow
 from app.llm import ModelResult
-from app.model_activation import ModelActivationError
 from app.rate_limit import RateLimiter
 from app.safety import SAFE_REFUSAL
 from app.state import ApplicationState
@@ -295,8 +294,7 @@ class PublicCommands(commands.Cog):
         except ValueError:
             is_admin = False
         admin = (
-            "\n\n管理员命令\n`/管理台` `/清空频道` `/人设` `/模型` "
-            "`/频道设置` `/主动发言` `/重载配置`"
+            "\n\n管理员命令\n`/管理台` `/清空频道` `/人设` `/频道设置` `/主动发言` `/重载配置`"
             if is_admin
             else ""
         )
@@ -314,7 +312,7 @@ class PublicCommands(commands.Cog):
         latency = f"{round(self.bot.latency * 1000)} ms" if self.bot.is_ready() else "未连接"
         await interaction.response.send_message(
             f"**{config['bot_name']}** · {'在线' if status.ready else '启动中'}\n"
-            f"模型：`{config['llm_provider']} / {config['llm_model']}`\n"
+            f"模型：`{config['llm_model'] or '未配置'}`（OpenAI 兼容接口）\n"
             f"延迟：{latency}\n"
             f"心情：{mood['label']}\n"
             f"主动发言：{'全局允许（仍需频道开启）' if config['proactive_global_enabled'] else '关闭'}\n"
@@ -536,58 +534,6 @@ class AdminCommands(commands.Cog):
         await interaction.response.send_message(
             "已恢复使用全局人设。" if value is None else "已更新本服务器的人设覆盖。",
             ephemeral=True,
-        )
-
-    @app_commands.command(name="模型", description="测试成功后切换模型提供方与模型 ID")
-    @app_commands.describe(provider="模型提供方", model="准确的模型 ID")
-    @app_commands.rename(provider="提供方", model="模型")
-    @app_commands.choices(
-        provider=[
-            app_commands.Choice(name="OpenAI", value="openai"),
-            app_commands.Choice(name="Anthropic", value="anthropic"),
-            app_commands.Choice(name="OpenRouter", value="openrouter"),
-            app_commands.Choice(name="Ollama / 兼容接口", value="ollama"),
-        ]
-    )
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.check(_allowlist_admin_check)
-    @app_commands.guild_only()
-    async def model(
-        self,
-        interaction: discord.Interaction,
-        provider: app_commands.Choice[str],
-        model: str,
-    ) -> None:
-        if not await self._allowed(interaction):
-            return
-        model_id = model.strip()
-        if not model_id:
-            await interaction.response.send_message("模型 ID 不能为空。", ephemeral=True)
-            return
-        try:
-            await self.state.model_activation.activate(
-                provider=provider.value,
-                role="chat",
-                model=model_id,
-                actor=f"discord:{interaction.user.id}",
-            )
-        except ModelActivationError as exc:
-            await interaction.response.send_message(
-                f"模型没有切换：{exc}",
-                ephemeral=True,
-            )
-            return
-        except Exception as exc:
-            # Provider exceptions can contain request metadata.  Keep Discord
-            # and ordinary logs on a fixed, non-secret error surface.
-            log.warning("discord model activation failed (%s)", type(exc).__name__)
-            await interaction.response.send_message(
-                "模型测试失败，原配置保持不变。请检查模型 ID、密钥和服务地址。",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_message(
-            f"测试通过，已切换为 `{provider.value} / {model_id}`。", ephemeral=True
         )
 
     @app_commands.command(name="频道设置", description="设置频道监听与主动发言权限")

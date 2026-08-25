@@ -19,6 +19,8 @@ from app.database import iso_now
 from app.llm import LLMConfigurationError, LLMProviderError
 from app.model_activation import (
     MODEL_MANAGED_SETTINGS,
+    MODEL_TUNING_FIELDS,
+    MODEL_TUNING_SETTINGS,
     ModelActivationError,
 )
 from app.runtime import SECTIONS, SETTING_FIELDS
@@ -315,9 +317,12 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         context = await common_context(request, required, page="settings")
         grouped: dict[str, list[Any]] = defaultdict(list)
         for field in SETTING_FIELDS:
+            if field.section == "模型":
+                continue
             grouped[field.section].append(field)
-        context["sections"] = [(section, grouped[section]) for section in SECTIONS]
-        context["model_managed_settings"] = MODEL_MANAGED_SETTINGS
+        context["sections"] = [
+            (section, grouped[section]) for section in SECTIONS if grouped.get(section)
+        ]
         return templates.TemplateResponse(request=request, name="settings.html", context=context)
 
     @app.post("/api/settings")
@@ -339,7 +344,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         )
         if blocked:
             return JSONResponse(
-                {"ok": False, "error": "模型提供方和模型 ID 只能在模型中心通过真实测试后修改"},
+                {"ok": False, "error": "模型连接、模型 ID 和生成参数只能在模型中心修改"},
                 status_code=400,
             )
         try:
@@ -365,7 +370,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return str(exc)
         if isinstance(exc, TimeoutError):
             return "模型测试超时，请检查网络和连接配置"
-        return f"{operation}失败，请检查提供方、模型 ID 和连接配置"
+        return f"{operation}失败，请检查接口端点、API Key 和模型 ID"
 
     @app.get("/models", response_class=HTMLResponse)
     async def models_page(request: Request):
@@ -376,7 +381,17 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         context["usage_7d"] = await state.usage.totals(7)
         context["usage_30d"] = await state.usage.totals(30)
         context["usage_rows"] = await state.usage.aggregate(30)
+        context["model_tuning_fields"] = MODEL_TUNING_FIELDS
         return templates.TemplateResponse(request=request, name="models.html", context=context)
+
+    def model_candidate_args(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "role": payload.get("role"),
+            "model": payload.get("model"),
+            "base_url": payload.get("base_url"),
+            "api_key": payload.get("api_key"),
+            "clear_api_key": bool(payload.get("clear_api_key", False)),
+        }
 
     @app.post("/api/models/discover")
     async def discover_models(request: Request):
@@ -388,9 +403,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
         try:
             candidate = await state.model_activation.candidate(
-                provider=payload.get("provider"),
-                role=payload.get("role"),
-                model=payload.get("model"),
+                **model_candidate_args(payload),
             )
             models = await state.llm.list_models(
                 candidate.config, force=bool(payload.get("force", True))
@@ -409,17 +422,22 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         except Exception as exc:
             log.warning("model discovery failed: %s", type(exc).__name__)
             return JSONResponse(
-                {"ok": False, "error": "模型列表获取失败，请检查提供方、模型 ID 和连接配置"},
+                {"ok": False, "error": "模型列表获取失败，请检查接口端点和 API Key"},
                 status_code=422,
             )
         await state.database.audit(
             required.username,
             "model.discover",
-            target=candidate.config["llm_provider"],
+            target="openai-compatible",
             details={"count": len(models)},
             ip_address=client_ip(request),
         )
-        return {"ok": True, "models": models[:2000], "count": len(models)}
+        return {
+            "ok": True,
+            "models": models[:2000],
+            "count": len(models),
+            "connection_changed": candidate.connection_changed,
+        }
 
     @app.post("/api/models/test")
     async def test_configured_model(request: Request):
@@ -431,9 +449,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
         try:
             candidate = await state.model_activation.candidate(
-                provider=payload.get("provider"),
-                role=payload.get("role"),
-                model=payload.get("model"),
+                **model_candidate_args(payload),
             )
             result = await state.llm.test_model(candidate.config, role=candidate.role)
         except (
@@ -452,7 +468,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             await state.usage.record("model_test", status="error", error_code=type(exc).__name__)
             log.warning("model test failed: %s", type(exc).__name__)
             return JSONResponse(
-                {"ok": False, "error": "模型测试失败，请检查提供方、模型 ID 和连接配置"},
+                {"ok": False, "error": "模型测试失败，请检查接口端点、API Key 和模型 ID"},
                 status_code=422,
             )
         await state.usage.record(
@@ -472,7 +488,6 @@ def create_web_app(state: ApplicationState) -> FastAPI:
         )
         return {
             "ok": True,
-            "provider": result.provider,
             "model": result.model,
             "latency_ms": round(result.latency_ms),
             "input_tokens": result.input_tokens,
@@ -489,9 +504,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
         try:
             activation = await state.model_activation.activate(
-                provider=payload.get("provider"),
-                role=payload.get("role"),
-                model=payload.get("model"),
+                **model_candidate_args(payload),
                 actor=required.username,
                 ip_address=client_ip(request),
             )
@@ -519,7 +532,7 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             return JSONResponse(
                 {
                     "ok": False,
-                    "error": "模型测试失败，模型未启用，请检查提供方、模型 ID 和连接配置",
+                    "error": "模型测试失败，配置未保存，请检查接口端点、API Key 和模型 ID",
                 },
                 status_code=422,
             )
@@ -538,7 +551,36 @@ def create_web_app(state: ApplicationState) -> FastAPI:
             details={"role": role},
             ip_address=client_ip(request),
         )
-        return {"ok": True, "provider": result.provider, "model": result.model, "role": role}
+        return {
+            "ok": True,
+            "model": result.model,
+            "role": role,
+            "key_configured": activation.key_configured,
+        }
+
+    @app.post("/api/models/settings")
+    async def update_model_settings(request: Request):
+        required = await require_api_session(request)
+        if isinstance(required, JSONResponse):
+            return required
+        payload = await request.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("values"), dict):
+            return JSONResponse({"ok": False, "error": "请求格式无效"}, status_code=422)
+        values = dict(payload["values"])
+        unknown = set(values) - MODEL_TUNING_SETTINGS
+        if unknown:
+            return JSONResponse(
+                {"ok": False, "error": "模型中心生成参数包含无效项目"}, status_code=422
+            )
+        try:
+            updated = await state.runtime.update(
+                values,
+                actor=required.username,
+                ip_address=client_ip(request),
+            )
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=422)
+        return {"ok": True, "values": {key: updated[key] for key in MODEL_TUNING_SETTINGS}}
 
     @app.get("/api/discord-admins")
     async def list_discord_admins(request: Request):

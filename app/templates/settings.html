@@ -19,14 +19,7 @@
         {% for field in fields %}
         <label class="config-field {{ 'wide' if field.kind == 'textarea' else '' }} {{ 'toggle-field' if field.kind == 'toggle' else '' }}">
           <span class="field-title">{{ field.label }}</span>
-          {% if field.key in model_managed_settings %}
-            {% if field.kind == 'select' %}
-              <select aria-readonly="true" disabled>{% for value, label in field.options %}<option value="{{ value }}" {{ 'selected' if config[field.key] == value else '' }}>{{ label }}</option>{% endfor %}</select>
-            {% else %}
-              <input type="text" value="{{ config[field.key] }}" readonly aria-readonly="true">
-            {% endif %}
-            <small>{{ field.help }} 模型提供方和模型 ID 请前往 <a href="/models">模型中心</a>，通过真实测试后启用。</small>
-          {% elif field.kind == 'toggle' %}
+          {% if field.kind == 'toggle' %}
             <span class="switch"><input type="checkbox" data-setting data-key="{{ field.key }}" data-kind="toggle" {{ 'checked' if config[field.key] else '' }}><i></i><b>{{ '已开启' if config[field.key] else '已关闭' }}</b></span>
           {% elif field.kind == 'textarea' %}
             <textarea data-setting data-key="{{ field.key }}" data-kind="textarea" rows="8">{{ config[field.key] }}</textarea>
@@ -38,7 +31,7 @@
           {% else %}
             <input type="{{ 'time' if field.kind == 'time' else 'number' if field.kind == 'number' else 'text' }}" data-setting data-key="{{ field.key }}" data-kind="{{ field.kind }}" value="{{ config[field.key] }}" {% if field.minimum is not none %}min="{{ field.minimum }}"{% endif %} {% if field.maximum is not none %}max="{{ field.maximum }}"{% endif %} {% if field.step is not none %}step="{{ field.step }}"{% endif %}>
           {% endif %}
-          {% if field.key not in model_managed_settings %}<small>{{ field.help }}</small>{% endif %}
+          <small>{{ field.help }}</small>
         </label>
         {% endfor %}
       </div>

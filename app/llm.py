@@ -155,9 +155,6 @@ class OpenAICompatibleBackend(LLMBackend):
                 "base_url": base_url,
                 "timeout": float(config["llm_timeout_seconds"]),
             }
-            headers = _openrouter_headers(config)
-            if headers:
-                kwargs["default_headers"] = headers
             client = AsyncOpenAI(**kwargs)
         self.client = client
         self._api_key = api_key
@@ -224,96 +221,6 @@ class OpenAICompatibleBackend(LLMBackend):
         )
 
 
-class AnthropicBackend(LLMBackend):
-    def __init__(
-        self,
-        config: dict[str, Any],
-        api_key: str,
-        *,
-        model: str | None = None,
-        client: Any = None,
-    ):
-        if client is None:
-            import anthropic
-
-            client = anthropic.AsyncAnthropic(
-                api_key=api_key, timeout=float(config["llm_timeout_seconds"])
-            )
-        self.client = client
-        self._api_key = api_key
-        self.provider = "anthropic"
-        self.model = model or str(config["llm_model"])
-        self.temperature = float(config["llm_temperature"])
-        self.max_tokens = int(config["llm_max_tokens"])
-
-    @staticmethod
-    def _content(content: Any) -> Any:
-        if not isinstance(content, list):
-            return content
-        converted: list[dict[str, Any]] = []
-        for item in content:
-            if item.get("type") == "text":
-                converted.append(item)
-            elif item.get("type") == "image_url":
-                converted.append(
-                    {
-                        "type": "image",
-                        "source": {"type": "url", "url": item["image_url"]["url"]},
-                    }
-                )
-        return converted
-
-    def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        system_parts = [
-            str(message["content"]) for message in messages if message["role"] == "system"
-        ]
-        user_messages = [
-            {"role": message["role"], "content": self._content(message["content"])}
-            for message in messages
-            if message["role"] != "system"
-        ]
-        return {
-            "model": self.model,
-            "system": "\n\n".join(system_parts),
-            "messages": user_messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-        }
-
-    async def stream(self, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
-        try:
-            async with self.client.messages.stream(**self._request(messages)) as response:
-                async for text in response.text_stream:
-                    yield text
-        except TimeoutError as exc:
-            raise TimeoutError(sanitize_error(exc, secrets=(self._api_key,))) from None
-        except Exception as exc:
-            raise LLMProviderError(sanitize_error(exc, secrets=(self._api_key,))) from None
-
-    async def complete_result(self, messages: list[dict[str, Any]]) -> ModelResult:
-        started = time.perf_counter()
-        try:
-            response = await self.client.messages.create(**self._request(messages))
-        except TimeoutError as exc:
-            raise TimeoutError(sanitize_error(exc, secrets=(self._api_key,))) from None
-        except Exception as exc:
-            raise LLMProviderError(sanitize_error(exc, secrets=(self._api_key,))) from None
-        text = _content_text(getattr(response, "content", None))
-        usage = getattr(response, "usage", None)
-        input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens")
-        output_tokens = _usage_value(usage, "output_tokens", "completion_tokens")
-        estimated = input_tokens is None or output_tokens is None
-        return ModelResult(
-            text=text,
-            input_tokens=input_tokens if input_tokens is not None else _messages_tokens(messages),
-            output_tokens=output_tokens if output_tokens is not None else _estimate_tokens(text),
-            latency_ms=(time.perf_counter() - started) * 1000,
-            provider=self.provider,
-            model=self.model,
-            usage_estimated=estimated,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class _Connection:
     provider: str
@@ -325,36 +232,26 @@ class _Connection:
         return hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
 
 
-def _openrouter_headers(config: Mapping[str, Any]) -> dict[str, str] | None:
-    if str(config["llm_provider"]).strip().lower() != "openrouter":
-        return None
-    return {
-        "HTTP-Referer": str(config.get("admin_public_url") or "https://github.com/Alakid-bot/mobo"),
-        "X-Title": "mobo",
-    }
-
-
 def _connection(config: Mapping[str, Any]) -> _Connection:
     provider = str(config["llm_provider"]).strip().lower()
-    if provider == "openai":
-        key = str(config.get("openai_api_key") or "")
-        if not key:
-            raise LLMConfigurationError("请先在管理台填写 OpenAI API Key")
-        return _Connection(provider, str(config["openai_base_url"]), key)
-    if provider == "openrouter":
-        key = str(config.get("openrouter_api_key") or "")
-        if not key:
-            raise LLMConfigurationError("请先在管理台填写 OpenRouter API Key")
-        return _Connection(provider, str(config["openrouter_base_url"]), key)
-    if provider == "ollama":
-        return _Connection(provider, str(config["ollama_base_url"]), "ollama")
-    if provider == "anthropic":
-        key = str(config.get("anthropic_api_key") or "")
-        if not key:
-            raise LLMConfigurationError("请先在管理台填写 Anthropic API Key")
-        base_url = str(config.get("anthropic_base_url") or "https://api.anthropic.com")
-        return _Connection(provider, base_url, key)
-    raise LLMConfigurationError(f"不支持的模型提供方：{provider}")
+    if provider != "openai":
+        raise LLMConfigurationError("当前只支持 OpenAI 兼容接口，请在模型中心重新配置")
+    base_url = str(config.get("openai_base_url") or "").strip().rstrip("/")
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise LLMConfigurationError("OpenAI 兼容端点必须是有效的 HTTP(S) 地址")
+    # The OpenAI SDK requires a non-empty client value even when a compatible
+    # local service has authentication disabled.  The placeholder is never
+    # persisted and is only sent to that explicitly configured endpoint.
+    key = str(config.get("openai_api_key") or "") or "not-required"
+    return _Connection(provider, base_url, key)
 
 
 def _select_model(config: Mapping[str, Any], role: ModelRole) -> str:
@@ -373,11 +270,9 @@ class ModelGateway:
         self,
         *,
         openai_client_factory: Callable[..., Any] | None = None,
-        anthropic_client_factory: Callable[..., Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._openai_client_factory = openai_client_factory
-        self._anthropic_client_factory = anthropic_client_factory
         self._monotonic = monotonic
         self._clients: dict[tuple[Any, ...], Any] = {}
         self._backends: dict[tuple[Any, ...], LLMBackend] = {}
@@ -388,7 +283,6 @@ class ModelGateway:
     def _cache_key(
         self, config: Mapping[str, Any], connection: _Connection, model: str
     ) -> tuple[Any, ...]:
-        headers = _openrouter_headers(config)
         return (
             connection.provider,
             connection.base_url.rstrip("/"),
@@ -397,7 +291,6 @@ class ModelGateway:
             float(config["llm_temperature"]),
             int(config["llm_max_tokens"]),
             float(config["llm_timeout_seconds"]),
-            tuple(sorted((headers or {}).items())),
         )
 
     def _ensure_open(self) -> None:
@@ -409,32 +302,16 @@ class ModelGateway:
     ) -> Any:
         if cache_key in self._clients:
             return self._clients[cache_key]
-        if connection.provider == "anthropic":
-            factory = self._anthropic_client_factory
-            if factory is None:
-                import anthropic
+        factory = self._openai_client_factory
+        if factory is None:
+            from openai import AsyncOpenAI
 
-                factory = anthropic.AsyncAnthropic
-            kwargs: dict[str, Any] = {
-                "api_key": connection.api_key,
-                "timeout": float(config["llm_timeout_seconds"]),
-            }
-            if "anthropic_base_url" in config and config.get("anthropic_base_url"):
-                kwargs["base_url"] = connection.base_url
-        else:
-            factory = self._openai_client_factory
-            if factory is None:
-                from openai import AsyncOpenAI
-
-                factory = AsyncOpenAI
-            kwargs = {
-                "api_key": connection.api_key,
-                "base_url": connection.base_url,
-                "timeout": float(config["llm_timeout_seconds"]),
-            }
-            headers = _openrouter_headers(config)
-            if headers:
-                kwargs["default_headers"] = headers
+            factory = AsyncOpenAI
+        kwargs: dict[str, Any] = {
+            "api_key": connection.api_key,
+            "base_url": connection.base_url,
+            "timeout": float(config["llm_timeout_seconds"]),
+        }
         client = factory(**kwargs)
         self._clients[cache_key] = client
         return client
@@ -448,18 +325,13 @@ class ModelGateway:
         if cached is not None:
             return cached
         client = self._new_client(config, connection, cache_key)
-        if connection.provider == "anthropic":
-            backend: LLMBackend = AnthropicBackend(
-                config, connection.api_key, model=model, client=client
-            )
-        else:
-            backend = OpenAICompatibleBackend(
-                config,
-                api_key=connection.api_key,
-                base_url=connection.base_url,
-                model=model,
-                client=client,
-            )
+        backend: LLMBackend = OpenAICompatibleBackend(
+            config,
+            api_key=connection.api_key,
+            base_url=connection.base_url,
+            model=model,
+            client=client,
+        )
         self._backends[cache_key] = backend
         return backend
 
@@ -507,10 +379,7 @@ class ModelGateway:
             cache_key = self._cache_key(config, connection, model)
             client = self._new_client(config, connection, cache_key)
             try:
-                if connection.provider == "anthropic":
-                    page = await _anthropic_models_list(client)
-                else:
-                    page = await _maybe_await(client.models.list())
+                page = await _maybe_await(client.models.list())
                 ids = sorted(set(await _model_ids(page)))
             except Exception as exc:
                 safe = sanitize_error(exc, secrets=(connection.api_key,))
@@ -574,14 +443,6 @@ class ModelGateway:
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
-
-
-async def _anthropic_models_list(client: Any) -> Any:
-    method = client.models.list
-    try:
-        return await _maybe_await(method(limit=1000))
-    except TypeError:
-        return await _maybe_await(method())
 
 
 async def _model_ids(page: Any) -> list[str]:

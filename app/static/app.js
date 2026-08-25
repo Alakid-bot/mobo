@@ -423,26 +423,35 @@
 
   const modelForm = document.querySelector("#model-center-form");
   if (modelForm) {
-    const provider = modelForm.querySelector('[name="provider"]');
+    const baseUrl = modelForm.querySelector('[name="base_url"]');
+    const apiKey = modelForm.querySelector('[name="api_key"]');
+    const clearApiKey = modelForm.querySelector('[name="clear_api_key"]');
     const role = modelForm.querySelector('[name="role"]');
     const model = modelForm.querySelector('[name="model"]');
     const options = modelForm.querySelector("#model-options");
     const count = modelForm.querySelector("[data-model-count]");
     const state = document.querySelector("[data-model-state]");
-    const payload = () => ({ provider: provider.value, role: role.value, model: model.value.trim() });
+    const payload = () => ({
+      base_url: baseUrl.value.trim(),
+      api_key: apiKey.value.trim(),
+      clear_api_key: clearApiKey.checked,
+      role: role.value,
+      model: model.value.trim(),
+    });
+    const markUntested = () => {
+      if (state) state.textContent = "尚未测试";
+    };
     role.addEventListener("change", () => {
       const key = `${role.value}Model`;
       model.value = modelForm.dataset[key] || modelForm.dataset.chatModel || "";
-      if (state) state.textContent = "尚未测试";
+      markUntested();
     });
-    provider.addEventListener("change", () => {
+    [baseUrl, apiKey, clearApiKey].forEach((input) => input.addEventListener("input", () => {
       if (options) options.replaceChildren();
-      if (count) count.textContent = "提供方已更改，请重新拉取列表";
-      if (state) state.textContent = "尚未测试";
-    });
-    model.addEventListener("input", () => {
-      if (state) state.textContent = "尚未测试";
-    });
+      if (count) count.textContent = "连接信息已更改，请重新拉取模型";
+      markUntested();
+    }));
+    model.addEventListener("input", markUntested);
 
     modelForm.querySelector("[data-model-discover]")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
@@ -457,7 +466,7 @@
           }));
         }
         if (count) count.textContent = `已拉取 ${result.count} 个模型，可输入关键词筛选`;
-        notify("模型列表已更新");
+        notify("连接成功，模型列表已更新；测试并启用后才会保存连接");
       } catch (error) {
         notify(error.message, "error");
       } finally {
@@ -487,8 +496,14 @@
       try {
         const result = await api("/api/models/activate", "POST", payload());
         modelForm.dataset[`${result.role}Model`] = result.model;
+        modelForm.dataset.keyConfigured = String(result.key_configured);
+        apiKey.value = "";
+        apiKey.placeholder = result.key_configured ? "已配置 · 留空继续使用" : "无鉴权接口可留空";
+        const badge = apiKey.closest(".secret-input")?.querySelector("span");
+        if (badge) badge.textContent = result.key_configured ? "SET" : "EMPTY";
+        clearApiKey.checked = false;
         if (state) state.textContent = "已测试并启用";
-        notify(`${result.model} 已启用`);
+        notify(`${result.model} 与接口连接已安全保存并启用`);
       } catch (error) {
         if (state) state.textContent = "未启用 · 测试失败";
         notify(error.message, "error");
@@ -497,6 +512,25 @@
       }
     });
   }
+
+  const modelSettingsForm = document.querySelector("#model-settings-form");
+  modelSettingsForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = {};
+    new FormData(modelSettingsForm).forEach((value, key) => {
+      values[key] = value;
+    });
+    const button = event.submitter || modelSettingsForm.querySelector("button[type=submit]");
+    if (button) button.disabled = true;
+    try {
+      await api("/api/models/settings", "POST", { values });
+      notify("生成参数已保存并立即生效");
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
 
   const passwordForm = document.querySelector("#password-form");
   passwordForm?.addEventListener("submit", async (event) => {
