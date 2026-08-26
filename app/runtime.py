@@ -389,17 +389,6 @@ SETTING_FIELDS: tuple[SettingField, ...] = (
         0.5,
     ),
     SettingField(
-        "conversation_window_minutes",
-        "连续聊天窗口分钟",
-        "回复与主动发言",
-        "number",
-        10,
-        "用户最近与 mobo 直接互动后，在此时间内可自然继续对话。",
-        0,
-        120,
-        1,
-    ),
-    SettingField(
         "max_concurrent_generations",
         "最大并发生成数",
         "回复与主动发言",

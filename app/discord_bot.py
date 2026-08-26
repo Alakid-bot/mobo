@@ -18,7 +18,6 @@ from app.conversation import (
     ConversationCapacityError,
     ConversationCoordinator,
     ConversationKey,
-    ConversationWindow,
     SummaryRequest,
     estimate_tokens,
     parse_summary_request,
@@ -669,10 +668,7 @@ class MoboBot(commands.Bot):
         self.coordinator: ConversationCoordinator | None = None
         self._coordinator_signature: tuple[float, int] | None = None
         self._generation_semaphore = asyncio.Semaphore(4)
-        self._conversation_window = ConversationWindow()
-        self._conversation_window_ttl = 600.0
         self._burst_buffer = BurstBuffer(ttl_seconds=30.0, max_keys=1024, max_items_per_key=8)
-        self._known_conversation_keys: OrderedDict[ConversationKey, None] = OrderedDict()
         self._summary_tasks: dict[str, set[asyncio.Task[Any]]] = defaultdict(set)
         self._summary_cooldowns: OrderedDict[str, float] = OrderedDict()
         self._seen_message_ids: dict[str, None] = {}
@@ -834,7 +830,6 @@ class MoboBot(commands.Bot):
             int(config["max_concurrent_generations"]),
         )
         if self.coordinator is not None and self._coordinator_signature == signature:
-            self._configure_window(config)
             return
         old = self.coordinator
         self._generation_semaphore = asyncio.Semaphore(signature[1])
@@ -847,17 +842,8 @@ class MoboBot(commands.Bot):
         self._generation_capacity = self.coordinator.max_pending
         self._generation_capacity_per_user = self.coordinator.max_pending_per_user
         self._coordinator_signature = signature
-        self._configure_window(config)
         if old is not None:
             await old.close()
-
-    def _configure_window(self, config: dict[str, Any]) -> None:
-        ttl = max(0.0, float(config["conversation_window_minutes"]) * 60)
-        if ttl == self._conversation_window_ttl:
-            return
-        self._conversation_window = ConversationWindow(ttl_seconds=ttl)
-        self._conversation_window_ttl = ttl
-        self._known_conversation_keys.clear()
 
     def _prune_user_event_epochs_locked(self, now: float) -> None:
         removable = [
@@ -950,21 +936,18 @@ class MoboBot(commands.Bot):
             self._prune_user_event_epochs_locked(now)
             self._user_event_condition.notify_all()
 
-    def _sync_conversation_metadata(self) -> None:
-        len(self._conversation_window)
-        live = self._conversation_window._entries
-        for key in [key for key in self._known_conversation_keys if key not in live]:
-            self._known_conversation_keys.pop(key, None)
-
-    def _record_conversation(self, key: ConversationKey) -> None:
-        self._conversation_window.record(key)
-        self._known_conversation_keys[key] = None
-        self._known_conversation_keys.move_to_end(key)
-        self._sync_conversation_metadata()
-
     def _next_generation_version(self) -> int:
         self._generation_sequence += 1
         return self._generation_sequence
+
+    async def _cancel_current_generation(
+        self, key: ConversationKey, *, discard_burst: bool = False
+    ) -> None:
+        self._generation_versions.pop(key, None)
+        if discard_burst:
+            self._burst_buffer.forget(key)
+        if self.coordinator is not None:
+            await self.coordinator.cancel(key)
 
     def _reserve_generation(self, key: ConversationKey) -> int | None:
         """Atomically reserve one bounded key slot before retaining a payload."""
@@ -1009,16 +992,16 @@ class MoboBot(commands.Bot):
 
     async def _reply_busy_if_obviously_direct(self, message: discord.Message) -> None:
         assert self.user is not None
-        user_id = str(message.author.id)
-        guild_id = str(message.guild.id) if message.guild else f"dm:{message.author.id}"
-        key = (guild_id, str(message.channel.id), user_id)
-        direct = bool(
-            message.guild is None
-            or self.user in message.mentions
-            or self._conversation_window.is_continuous(key)
-        )
-        if not direct:
-            direct = await self._reply_to_bot(message, self.user.id)
+        config = await self.state.runtime.all()
+        if message.guild is None:
+            direct = bool(config["dm_enabled"])
+        else:
+            mentioned = self.user in message.mentions
+            replied = await self._reply_to_bot(message, self.user.id)
+            direct = bool(
+                (mentioned and config["reply_to_mentions"])
+                or (replied and config["reply_to_replies"])
+            )
         await self._reply_busy_if_direct(message, direct=direct)
 
     async def cancel_user_activity(self, user_id: str) -> None:
@@ -1038,9 +1021,6 @@ class MoboBot(commands.Bot):
                 running.append(task)
         if running:
             await asyncio.gather(*running, return_exceptions=True)
-        for key in [key for key in self._known_conversation_keys if key[2] == user_id]:
-            self._conversation_window.forget(key)
-            self._known_conversation_keys.pop(key, None)
         for key in [key for key in self._generation_versions if key[2] == user_id]:
             self._generation_versions.pop(key, None)
         if self.coordinator is not None:
@@ -1081,9 +1061,6 @@ class MoboBot(commands.Bot):
                 self._summary_cooldowns.pop(user_id, None)
                 self._busy_notices.pop(user_id, None)
                 self.rate_limiter.purge(user_id)
-                for key in [key for key in self._known_conversation_keys if key[2] == user_id]:
-                    self._conversation_window.forget(key)
-                    self._known_conversation_keys.pop(key, None)
                 for key in [key for key in self._generation_versions if key[2] == user_id]:
                     self._generation_versions.pop(key, None)
                 for message_id, (origin_user_id, _guild_id) in list(
@@ -1248,9 +1225,6 @@ class MoboBot(commands.Bot):
         guild_id = str(message.guild.id) if message.guild else f"dm:{message.author.id}"
         channel_id = str(message.channel.id)
         key = (guild_id, channel_id, user_id)
-        self._generation_versions.pop(key, None)
-        if self.coordinator is not None:
-            await self.coordinator.cancel(key)
         channel_config = (
             {"listen_enabled": True, "proactive_enabled": False}
             if is_dm
@@ -1261,14 +1235,13 @@ class MoboBot(commands.Bot):
         replied = await self._reply_to_bot(message, self.user.id)
         if not self._message_allowed(user_id):
             return
-        continued = self._conversation_window.is_continuous(key)
-        self._sync_conversation_metadata()
         direct = (
             is_dm
             or (mentioned and config["reply_to_mentions"])
             or (replied and config["reply_to_replies"])
-            or (continued and config["social_awareness_enabled"])
         )
+        if direct:
+            await self._cancel_current_generation(key)
 
         text = re.sub(rf"<@!?{self.user.id}>", "", message.content).strip()
         safety = await self.state.safety.check_input(
@@ -1306,11 +1279,11 @@ class MoboBot(commands.Bot):
         summary_trigger = summary_request is not None and (
             mentioned or (summary_request.from_reply and message.reference is not None)
         )
-        if summary_trigger:
+        if summary_trigger and not direct:
             direct = True
+            await self._cancel_current_generation(key)
 
         if direct:
-            self._record_conversation(key)
             await self.state.memories.touch_profile(user_id, str(message.author))
             if not self._message_allowed(user_id):
                 return
@@ -1358,14 +1331,19 @@ class MoboBot(commands.Bot):
                     mention_author=False,
                 )
                 return
+            await self._cancel_current_generation(key, discard_burst=True)
             await self._run_summary_tracked(message, summary_request, config, guild_id, channel_id)
             return
 
         proactive_reason: str | None = None
         if not direct:
-            if not listened:
-                return
-            if not config["social_awareness_enabled"]:
+            proactive_enabled = bool(
+                listened
+                and channel_config["proactive_enabled"]
+                and config["proactive_global_enabled"]
+                and config["social_awareness_enabled"]
+            )
+            if not proactive_enabled:
                 return
             decision = await self.state.proactive.decide(
                 guild_id, channel_id, user_id, safety.text, config
@@ -2131,9 +2109,7 @@ class MoboBot(commands.Bot):
         self._summary_tasks.clear()
         self._summary_cooldowns.clear()
         self._busy_notices.clear()
-        self._conversation_window.clear()
         self._burst_buffer.clear()
-        self._known_conversation_keys.clear()
         self._bot_message_origins.clear()
         self._generation_versions.clear()
         self.rate_limiter.clear()

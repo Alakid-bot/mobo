@@ -323,6 +323,76 @@ async def test_same_key_new_message_cancels_old_generation_without_old_output(st
 
 
 @pytest.mark.asyncio
+async def test_recent_direct_chat_does_not_authorize_an_ordinary_followup(state):
+    bot, bot_user, channel = await _ready_bot(state)
+    state.proactive.decide = AsyncMock()
+    state.llm.complete = AsyncMock(return_value=_model_result("只回复直接触发"))
+    user = FakeUser(111111111111111)
+
+    await bot.on_message(
+        FakeMessage(203, user, channel, f"<@{bot_user.id}> 你好", mentions=[bot_user])
+    )
+    await bot.on_message(FakeMessage(204, user, channel, "这是没有艾特或回复的普通发言"))
+
+    assert state.llm.complete.await_count == 1
+    state.proactive.decide.assert_not_awaited()
+    assert [item.content for item in channel.sent] == ["只回复直接触发"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_messages_require_both_proactive_switches_before_evaluation(state):
+    bot, _bot_user, channel = await _ready_bot(state)
+    state.proactive.decide = AsyncMock(
+        return_value=SimpleNamespace(should_speak=False, reason="测试不发送")
+    )
+    user = FakeUser(111111111111111)
+
+    await state.runtime.update({"proactive_global_enabled": True}, actor="test")
+    await bot.on_message(FakeMessage(207, user, channel, "频道没有主动参与授权"))
+    state.proactive.decide.assert_not_awaited()
+
+    await state.runtime.update({"proactive_global_enabled": False}, actor="test")
+    await state.channels.set(
+        "333333333333333",
+        "444444444444444",
+        "general",
+        listen_enabled=True,
+        proactive_enabled=True,
+    )
+    await bot.on_message(FakeMessage(208, user, channel, "全局主动发言仍然关闭"))
+    state.proactive.decide.assert_not_awaited()
+
+    await state.runtime.update({"proactive_global_enabled": True}, actor="test")
+    await bot.on_message(FakeMessage(209, user, channel, "两个开关都已开启"))
+    state.proactive.decide.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_followup_does_not_cancel_an_in_flight_direct_reply(state):
+    bot, bot_user, channel = await _ready_bot(state)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def complete(_config, _messages, *, role):
+        started.set()
+        await release.wait()
+        return _model_result("直接触发仍然完成")
+
+    state.llm.complete = AsyncMock(side_effect=complete)
+    user = FakeUser(111111111111111)
+    direct = FakeMessage(205, user, channel, f"<@{bot_user.id}> 请回答", mentions=[bot_user])
+    task = asyncio.create_task(bot.on_message(direct))
+    await started.wait()
+
+    await bot.on_message(FakeMessage(206, user, channel, "普通频道发言"))
+    release.set()
+    await task
+
+    assert state.llm.complete.await_count == 1
+    assert [item.content for item in channel.sent] == ["直接触发仍然完成"]
+
+
+@pytest.mark.asyncio
 async def test_high_cardinality_generation_backpressure_recovers_and_purges(state):
     import app.discord_bot as discord_bot_module
 
@@ -600,19 +670,16 @@ async def test_user_keyed_process_metadata_has_hard_caps_and_purge_erases_owner(
         await bot._release_user_event(ticket)
         bot.rate_limiter.allow(f"guild:{user_id}", 10, 60, owner_id=user_id)
         bot._record_summary_cooldown(user_id, float(index))
-        bot._record_conversation(("guild", str(index), user_id))
 
     assert len(bot._user_event_epochs) <= 4096
     assert len(bot.rate_limiter) <= 4096
     assert len(bot._summary_cooldowns) <= 4096
-    assert len(bot._known_conversation_keys) <= bot._conversation_window.max_entries
 
     target = "999999999999999"
     target_key = ("guild", "channel", target)
     ticket = await bot._admit_user_event((target,))
     assert ticket is not None
     await bot._release_user_event(ticket)
-    bot._record_conversation(target_key)
     bot._burst_buffer.append(target_key, "private burst")
     bot._record_summary_cooldown(target, 6000.0)
     bot._remember_bot_message("message", target, "guild")
@@ -625,7 +692,6 @@ async def test_user_keyed_process_metadata_has_hard_caps_and_purge_erases_owner(
     assert target not in bot._active_user_events
     assert target not in bot._purging_users
     assert target not in bot._summary_cooldowns
-    assert all(target not in str(item) for item in bot._known_conversation_keys)
     assert all(target not in str(item) for item in bot._generation_versions)
     assert all(target not in str(item) for item in bot._burst_buffer._entries)
     assert all(target not in str(item) for item in bot._bot_message_origins.items())

@@ -8,7 +8,6 @@ from app.conversation import (
     BurstBuffer,
     ConversationCapacityError,
     ConversationCoordinator,
-    ConversationWindow,
     SummaryRequest,
     estimate_tokens,
     parse_summary_request,
@@ -177,19 +176,6 @@ async def test_coordinator_bounds_distinct_keys_but_replacement_reuses_a_slot():
     assert "overflow" not in started
     assert "same-user-overflow" not in started
     await coordinator.close()
-
-
-def test_conversation_window_has_ttl_and_capacity_bounds():
-    now = [100.0]
-    window = ConversationWindow(ttl_seconds=10, max_entries=2, clock=lambda: now[0])
-    window.record("g", "c", "u1")
-    window.record("g", "c", "u2")
-    window.record("g", "c", "u3")
-    assert len(window) == 2
-    assert not window.is_continuous("g", "c", "u1")
-    assert window.is_continuous(("g", "c", "u3"))
-    now[0] = 111
-    assert not window.is_continuous("g", "c", "u3")
 
 
 def test_burst_buffer_isolated_bounded_expiring_and_forgettable():

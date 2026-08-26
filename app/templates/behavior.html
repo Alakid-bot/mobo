@@ -6,7 +6,7 @@
 
 <section class="panel" id="channels">
   <div class="panel-head"><div><p class="eyebrow">CHANNEL POLICY</p><h2>频道授权</h2></div><span class="status-chip {{ 'on' if config.proactive_global_enabled else '' }}">全局主动发言 {{ '开' if config.proactive_global_enabled else '关' }}</span></div>
-  <p class="panel-intro">先选择服务器和频道，再选择它能使用多少上下文。“仅直接响应”仍允许艾特和回复，但不会保存频道上下文；主动参与必须同时允许上下文。</p>
+  <p class="panel-intro">先选择服务器和频道，再选择它能使用多少上下文。“仅直接响应”仍允许艾特和回复，但不会保存频道上下文；“读取上下文”不会自动回复；主动参与必须同时允许上下文，并打开全局主动发言。</p>
   <form id="channel-policy-form" class="channel-policy-form">
     <label>服务器<select name="guild_id" data-channel-guild required><option value="">选择服务器</option>{% for guild in guilds %}<option value="{{ guild.guild_id }}">{{ guild.name }}</option>{% endfor %}</select></label>
     <label>文字频道<select name="channel_id" data-channel-select required disabled><option value="">先选择服务器</option>{% for channel in channels %}<option value="{{ channel.channel_id }}" data-guild-id="{{ channel.guild_id }}" data-channel-name="{{ channel.channel_name }}"># {{ channel.channel_name or channel.channel_id }}</option>{% endfor %}</select></label>
